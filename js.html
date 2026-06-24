@@ -1,0 +1,1480 @@
+<html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JavaScript শেখার রোডম্যাপ</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Hind Siliguri', sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px 60px; }
+  .header { text-align: center; margin-bottom: 40px; }
+  .header .badge { display: inline-block; background: linear-gradient(135deg,#f7df1e,#f97316); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px; }
+  .header h1 { font-size: clamp(26px,6vw,44px); font-weight: 700; color: #f1f5f9; line-height: 1.2; }
+  .header h1 span { background: linear-gradient(135deg,#f7df1e,#f97316); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header p { margin-top: 10px; color: #94a3b8; font-size: 15px; }
+
+  .copy-wrap { max-width: 720px; margin: 0 auto 20px; display: flex; justify-content: flex-end; }
+  #copyBtn { display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg,#f7df1e,#f97316); color: #0f0f1a; border: none; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-family: 'Hind Siliguri', sans-serif; font-weight: 600; cursor: pointer; transition: opacity .2s, transform .1s; }
+  #copyBtn:active { transform: scale(.96); opacity: .85; }
+  #copyBtn.done { background: linear-gradient(135deg,#3ecf8e,#10b981); color: #fff; }
+
+  .progress-bar-wrap { max-width: 720px; margin: 0 auto 28px; }
+  .progress-info { display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 6px; }
+  .progress-track { height: 6px; background: #1e1e32; border-radius: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg,#f7df1e,#f97316); border-radius: 10px; transition: width .4s ease; width: 0%; }
+
+  .timeline { max-width: 720px; margin: 0 auto; position: relative; }
+  .timeline::before { content:''; position: absolute; left: 28px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom,#f7df1e44,#f9731644); }
+
+  .phase { margin-bottom: 8px; position: relative; }
+  .phase-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px 14px 68px; background: #1e1e32; border: 1px solid #2a2a45; border-radius: 12px; cursor: pointer; transition: background .2s, border-color .2s; position: relative; user-select: none; }
+  .phase-header:hover { background: #252540; border-color: #3a3a60; }
+  .phase-dot { position: absolute; left: -44px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 3px solid; background: #0f0f1a; z-index: 1; }
+  .phase-number { font-size: 11px; font-weight: 700; letter-spacing: 1px; min-width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-title { flex: 1; font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .phase-sub { font-size: 11px; color: #64748b; font-weight: 400; display: block; margin-top: 2px; }
+  .phase-time { font-size: 11px; color: #64748b; background: #1a1a2e; border: 1px solid #2a2a45; padding: 3px 8px; border-radius: 20px; white-space: nowrap; }
+  .chevron { font-size: 11px; color: #4a5568; transition: transform .3s; flex-shrink: 0; }
+  .phase.open .chevron { transform: rotate(180deg); }
+
+  .topics { display: none; padding: 0 0 8px 68px; }
+  .phase.open .topics { display: block; }
+  .topics-inner { background: #16162a; border: 1px solid #2a2a45; border-top: none; border-radius: 0 0 12px 12px; padding: 12px; }
+
+  .topic-item { margin-bottom: 6px; border-radius: 8px; overflow: hidden; }
+  .topic-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; cursor: pointer; transition: background .15s; }
+  .topic-row:hover { background: #1e1e32; }
+  .topic-check { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #3a3a60; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; transition: all .2s; }
+  .topic-check.checked { border-color: #f7df1e; background: #f7df1e22; }
+  .topic-check.checked::after { content: '✓'; font-size: 11px; color: #f7df1e; font-weight: 700; }
+  .topic-text { font-size: 14px; color: #cbd5e1; line-height: 1.5; flex: 1; }
+  .topic-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .tag-imp { background: #7c3aed22; color: #a78bfa; border: 1px solid #7c3aed44; }
+  .tag-pro { background: #0369a122; color: #38bdf8; border: 1px solid #0369a144; }
+  .expand-icon { font-size: 10px; color: #4a5568; flex-shrink: 0; margin-top: 3px; transition: transform .2s; }
+  .topic-item.open .expand-icon { transform: rotate(90deg); }
+
+  .topic-detail { display: none; padding: 0 10px 12px 38px; }
+  .topic-item.open .topic-detail { display: block; }
+  .detail-box { background: #0f0f1a; border: 1px solid #2a2a45; border-radius: 8px; padding: 12px 14px; }
+  .detail-box p { font-size: 13px; color: #94a3b8; line-height: 1.7; margin-bottom: 8px; }
+  .detail-box p:last-child { margin-bottom: 0; }
+  pre { background: #1a1a2e; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin-top: 8px; }
+  code { font-family: 'Courier New', monospace; font-size: 12px; color: #7dd3fc; line-height: 1.6; white-space: pre; }
+  .cm { color: #64748b; }
+  .ck { color: #c084fc; }
+  .cs { color: #86efac; }
+  .cn { color: #fbbf24; }
+  .cf { color: #38bdf8; }
+
+  .p1 .phase-dot{border-color:#f59e0b} .p1 .phase-number{background:#f59e0b22;color:#f59e0b}
+  .p2 .phase-dot{border-color:#3b82f6} .p2 .phase-number{background:#3b82f622;color:#3b82f6}
+  .p3 .phase-dot{border-color:#8b5cf6} .p3 .phase-number{background:#8b5cf622;color:#8b5cf6}
+  .p4 .phase-dot{border-color:#ec4899} .p4 .phase-number{background:#ec489922;color:#ec4899}
+  .p5 .phase-dot{border-color:#10b981} .p5 .phase-number{background:#10b98122;color:#10b981}
+  .p6 .phase-dot{border-color:#f97316} .p6 .phase-number{background:#f9731622;color:#f97316}
+  .p7 .phase-dot{border-color:#06b6d4} .p7 .phase-number{background:#06b6d422;color:#06b6d4}
+  .p8 .phase-dot{border-color:#f7df1e} .p8 .phase-number{background:#f7df1e22;color:#f7df1e}
+  .p9 .phase-dot{border-color:#a855f7} .p9 .phase-number{background:#a855f722;color:#a855f7}
+  .p10 .phase-dot{border-color:#f43f5e} .p10 .phase-number{background:#f43f5e22;color:#f43f5e}
+
+  .tip-box { max-width: 720px; margin: 28px auto 0; background: #16162a; border: 1px solid #2a2a45; border-left: 3px solid #f7df1e; border-radius: 10px; padding: 16px 20px; }
+  .tip-box h3 { font-size: 14px; color: #f7df1e; margin-bottom: 8px; }
+  .tip-box ul { list-style: none; }
+  .tip-box li { font-size: 13px; color: #94a3b8; padding: 4px 0; }
+  .tip-box li::before { content: '→ '; color: #f7df1e; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="header">
+  <div class="badge">📚 Complete Roadmap</div>
+  <h1>JavaScript শেখার <span>A to Z গাইড</span></h1>
+  <p>প্রতিটি টপিকে ব্যাখ্যা ও কোড উদাহরণ সহ — ক্লিক করে বিস্তারিত দেখুন</p>
+</div>
+
+<div class="copy-wrap">
+  <button id="copyBtn" onclick="copyCode()">📋 HTML কোড কপি করুন</button>
+</div>
+
+<div class="progress-bar-wrap">
+  <div class="progress-info"><span>অগ্রগতি</span><span id="prog-text">0 / 47 টপিক সম্পন্ন</span></div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill" style="width: 0%;"></div></div>
+</div>
+
+<div class="timeline">
+
+<!-- ===== PHASE 1 ===== -->
+<div class="phase p1 open" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১</div>
+  <div class="phase-title">শুরুর প্রস্তুতি (Setup)<span class="phase-sub">JS পরিচয় ও পরিবেশ তৈরি</span></div>
+  <span class="phase-time">১-২ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item open">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">JavaScript কী এবং কেন শিখবো?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>JavaScript একটি উচ্চ-স্তরের, ডায়নামিক প্রোগ্রামিং ভাষা। এটি শিখবেন কারণ:</p>
+    <p>• ওয়েব ব্রাউজারের একমাত্র প্রোগ্রামিং ভাষা<br>• ফ্রন্টএন্ড ও ব্যাকএন্ড (Node.js) — দুটোই করা যায়<br>• React, Vue, Angular — সব জনপ্রিয় ফ্রেমওয়ার্ক JS-এ<br>• চাকরির বাজারে সর্বোচ্চ চাহিদার ভাষাগুলোর একটি</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ব্রাউজার Console ব্যবহার</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Chrome বা Firefox-এ <strong style="color:#f1f5f9">F12</strong> চাপুন → Console ট্যাবে যান। এখানেই JS কোড লিখে সাথে সাথে রান করা যায়।</p>
+    <pre><code><span class="cf">console</span>.log(<span class="cs">"Hello, World!"</span>);
+<span class="cm">// আউটপুট: Hello, World!</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">VS Code সেটআপ ও Live Server</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">VS Code</strong> ডাউনলোড করুন। তারপর <strong style="color:#fbbf24">Live Server</strong> এক্সটেনশন ইনস্টল করুন — HTML ফাইল সেভ করলেই ব্রাউজারে অটো রিফ্রেশ হবে।</p>
+    <p>মোবাইলে <strong style="color:#f7df1e">Spck Editor</strong> অ্যাপ ব্যবহার করুন (Android/iOS)।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">HTML-এ JS যুক্ত করার উপায়</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>তিনভাবে JS যুক্ত করা যায় — ইনলাইন, ইন্টার্নাল ও এক্সটার্নাল ফাইল।</p>
+    <pre><code><span class="cm">&lt;!-- ইন্টার্নাল --&gt;</span>
+&lt;<span class="ck">script</span>&gt;
+  <span class="cf">console</span>.log(<span class="cs">"চলছে!"</span>);
+&lt;/<span class="ck">script</span>&gt;
+
+<span class="cm">&lt;!-- এক্সটার্নাল ফাইল --&gt;</span>
+&lt;<span class="ck">script</span> src=<span class="cs">"app.js"</span>&gt;&lt;/<span class="ck">script</span>&gt;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 2 ===== -->
+<div class="phase p2" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">২</div>
+  <div class="phase-title">মূল ভিত্তি (Basics)<span class="phase-sub">ভেরিয়েবল, ডেটা টাইপ, অপারেটর</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">var, let, const <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f7df1e">let</strong> ও <strong style="color:#f7df1e">const</strong> ব্যবহার করুন — পুরনো <code>var</code> এড়িয়ে চলুন।</p>
+    <pre><code><span class="ck">let</span> naam = <span class="cs">"Maidul"</span>;      <span class="cm">// পরিবর্তনযোগ্য</span>
+<span class="ck">const</span> boyosh = <span class="cn">25</span>;       <span class="cm">// পরিবর্তন করা যাবে না</span>
+naam = <span class="cs">"Rahim"</span>;           <span class="cm">// ✓ ঠিক আছে</span>
+<span class="cm">// boyosh = 30;         // ✗ Error হবে</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ডেটা টাইপ: String, Number, Boolean, null, undefined</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> naam = <span class="cs">"Maidul"</span>;   <span class="cm">// String</span>
+<span class="ck">let</span> boyosh = <span class="cn">25</span>;       <span class="cm">// Number</span>
+<span class="ck">let</span> active = <span class="ck">true</span>;     <span class="cm">// Boolean</span>
+<span class="ck">let</span> x = <span class="ck">null</span>;          <span class="cm">// ইচ্ছাকৃতভাবে খালি</span>
+<span class="ck">let</span> y;                 <span class="cm">// undefined — মান দেওয়া হয়নি</span>
+<span class="cf">console</span>.log(<span class="ck">typeof</span> naam); <span class="cm">// "string"</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">গাণিতিক অপারেটর</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> a = <span class="cn">10</span>, b = <span class="cn">3</span>;
+<span class="cf">console</span>.log(a + b);   <span class="cm">// যোগ → 13</span>
+<span class="cf">console</span>.log(a - b);   <span class="cm">// বিয়োগ → 7</span>
+<span class="cf">console</span>.log(a * b);   <span class="cm">// গুণ → 30</span>
+<span class="cf">console</span>.log(a / b);   <span class="cm">// ভাগ → 3.333</span>
+<span class="cf">console</span>.log(a % b);   <span class="cm">// ভাগশেষ → 1</span>
+<span class="cf">console</span>.log(a ** b);  <span class="cm">// ঘাত → 1000</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">তুলনামূলক অপারেটর (== vs ===) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>JS-এ <strong style="color:#f7df1e">===</strong> (strict) ব্যবহার করুন — টাইপ ও মান দুটোই মেলায়।</p>
+    <pre><code><span class="cf">console</span>.log(<span class="cn">5</span> == <span class="cs">"5"</span>);   <span class="cm">// true (শুধু মান)</span>
+<span class="cf">console</span>.log(<span class="cn">5</span> === <span class="cs">"5"</span>);  <span class="cm">// false (টাইপ আলাদা)</span>
+<span class="cf">console</span>.log(<span class="cn">10</span> &gt; <span class="cn">3</span>);     <span class="cm">// true</span>
+<span class="cf">console</span>.log(<span class="cn">5</span> !== <span class="cn">3</span>);    <span class="cm">// true</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">লজিক্যাল অপারেটর (&amp;&amp;, ||, !)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> x = <span class="cn">10</span>;
+<span class="cf">console</span>.log(x &gt; <span class="cn">5</span> &amp;&amp; x &lt; <span class="cn">20</span>); <span class="cm">// উভয় সত্য → true</span>
+<span class="cf">console</span>.log(x &gt; <span class="cn">5</span> || x &gt; <span class="cn">100</span>); <span class="cm">// একটি সত্য → true</span>
+<span class="cf">console</span>.log(!(x &gt; <span class="cn">5</span>));          <span class="cm">// উল্টো → false</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Template Literal (ব্যাকটিক স্ট্রিং) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Python-এর f-string-এর মতো — ব্যাকটিক ` ` দিয়ে ভেরিয়েবল সরাসরি টেক্সটে বসানো যায়।</p>
+    <pre><code><span class="ck">let</span> naam = <span class="cs">"Maidul"</span>;
+<span class="ck">let</span> boyosh = <span class="cn">25</span>;
+<span class="cf">console</span>.log(<span class="cs">`আমার নাম ${naam}, বয়স ${boyosh}`</span>);
+<span class="cm">// আউটপুট: আমার নাম Maidul, বয়স 25</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 3 ===== -->
+<div class="phase p3" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৩</div>
+  <div class="phase-title">কন্ট্রোল ফ্লো (Control Flow)<span class="phase-sub">শর্ত ও লুপ দিয়ে প্রোগ্রাম নিয়ন্ত্রণ</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">if / else if / else শর্ত <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> marks = <span class="cn">75</span>;
+<span class="ck">if</span> (marks &gt;= <span class="cn">80</span>) {
+    <span class="cf">console</span>.log(<span class="cs">"A+"</span>);
+} <span class="ck">else if</span> (marks &gt;= <span class="cn">70</span>) {
+    <span class="cf">console</span>.log(<span class="cs">"A"</span>);   <span class="cm">// এটি প্রিন্ট হবে</span>
+} <span class="ck">else</span> {
+    <span class="cf">console</span>.log(<span class="cs">"B"</span>);
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Ternary Operator (শর্টকাট শর্ত)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>এক লাইনে if-else লেখার উপায়।</p>
+    <pre><code><span class="ck">let</span> boyosh = <span class="cn">20</span>;
+<span class="ck">let</span> result = boyosh &gt;= <span class="cn">18</span> ? <span class="cs">"প্রাপ্তবয়স্ক"</span> : <span class="cs">"নাবালক"</span>;
+<span class="cf">console</span>.log(result); <span class="cm">// প্রাপ্তবয়স্ক</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">switch statement</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> day = <span class="cs">"শুক্র"</span>;
+<span class="ck">switch</span> (day) {
+  <span class="ck">case</span> <span class="cs">"শুক্র"</span>:
+    <span class="cf">console</span>.log(<span class="cs">"ছুটির দিন!"</span>); <span class="ck">break</span>;
+  <span class="ck">case</span> <span class="cs">"শনি"</span>:
+    <span class="cf">console</span>.log(<span class="cs">"আধা ছুটি"</span>); <span class="ck">break</span>;
+  <span class="ck">default</span>:
+    <span class="cf">console</span>.log(<span class="cs">"কর্মদিবস"</span>);
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">for লুপ <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">for</span> (<span class="ck">let</span> i = <span class="cn">1</span>; i &lt;= <span class="cn">5</span>; i++) {
+  <span class="cf">console</span>.log(<span class="cs">`সংখ্যা: ${i}`</span>);
+}
+<span class="cm">// সংখ্যা: 1, সংখ্যা: 2 ... সংখ্যা: 5</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">while ও do...while লুপ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> i = <span class="cn">1</span>;
+<span class="ck">while</span> (i &lt;= <span class="cn">3</span>) {
+  <span class="cf">console</span>.log(i); <span class="cm">// 1, 2, 3</span>
+  i++;
+}
+
+<span class="ck">let</span> j = <span class="cn">1</span>;
+<span class="ck">do</span> {
+  <span class="cf">console</span>.log(j); <span class="cm">// কমপক্ষে একবার রান হয়</span>
+  j++;
+} <span class="ck">while</span> (j &lt;= <span class="cn">3</span>);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">break ও continue</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">for</span> (<span class="ck">let</span> i = <span class="cn">1</span>; i &lt;= <span class="cn">5</span>; i++) {
+  <span class="ck">if</span> (i === <span class="cn">3</span>) <span class="ck">continue</span>; <span class="cm">// 3 বাদ দেয়</span>
+  <span class="ck">if</span> (i === <span class="cn">5</span>) <span class="ck">break</span>;    <span class="cm">// 5-এ থামে</span>
+  <span class="cf">console</span>.log(i); <span class="cm">// 1, 2, 4</span>
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 4 ===== -->
+<div class="phase p4" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৪</div>
+  <div class="phase-title">ফাংশন (Functions)<span class="phase-sub">কোড পুনর্ব্যবহারযোগ্য করা</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">function Declaration <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">function</span> <span class="cf">yog_karo</span>(a, b) {
+  <span class="ck">return</span> a + b;
+}
+<span class="cf">console</span>.log(<span class="cf">yog_karo</span>(<span class="cn">5</span>, <span class="cn">3</span>)); <span class="cm">// 8</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Arrow Function (=&gt;)<span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>আধুনিক JS-এ সবচেয়ে বেশি ব্যবহৃত ফাংশন লেখার পদ্ধতি।</p>
+    <pre><code><span class="ck">const</span> <span class="cf">yog_karo</span> = (a, b) =&gt; a + b;
+<span class="cf">console</span>.log(<span class="cf">yog_karo</span>(<span class="cn">5</span>, <span class="cn">3</span>)); <span class="cm">// 8</span>
+
+<span class="ck">const</span> <span class="cf">greet</span> = naam =&gt; <span class="cs">`স্বাগতম, ${naam}!`</span>;
+<span class="cf">console</span>.log(<span class="cf">greet</span>(<span class="cs">"Rahim"</span>)); <span class="cm">// স্বাগতম, Rahim!</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Default Parameter ও Rest Parameter</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">function</span> <span class="cf">greet</span>(naam = <span class="cs">"বন্ধু"</span>) {
+  <span class="cf">console</span>.log(<span class="cs">`হ্যালো, ${naam}!`</span>);
+}
+<span class="cf">greet</span>();            <span class="cm">// হ্যালো, বন্ধু!</span>
+<span class="cf">greet</span>(<span class="cs">"Karim"</span>);    <span class="cm">// হ্যালো, Karim!</span>
+
+<span class="ck">function</span> <span class="cf">yog</span>(...nums) {
+  <span class="ck">return</span> nums.reduce((a, b) =&gt; a + b, <span class="cn">0</span>);
+}
+<span class="cf">console</span>.log(<span class="cf">yog</span>(<span class="cn">1</span>,<span class="cn">2</span>,<span class="cn">3</span>,<span class="cn">4</span>)); <span class="cm">// 10</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Scope — Global ও Local</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> global = <span class="cs">"সবাই দেখতে পায়"</span>;
+
+<span class="ck">function</span> <span class="cf">test</span>() {
+  <span class="ck">let</span> local = <span class="cs">"শুধু ভেতরে"</span>;
+  <span class="cf">console</span>.log(global); <span class="cm">// ✓ কাজ করবে</span>
+  <span class="cf">console</span>.log(local);  <span class="cm">// ✓ কাজ করবে</span>
+}
+<span class="cm">// console.log(local); // ✗ Error!</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Callback Function <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>একটি ফাংশনকে অন্য ফাংশনের ভেতরে পাঠানো হয়।</p>
+    <pre><code><span class="ck">function</span> <span class="cf">kaj_karo</span>(callback) {
+  <span class="cf">console</span>.log(<span class="cs">"কাজ শুরু..."</span>);
+  <span class="cf">callback</span>();
+}
+
+<span class="cf">kaj_karo</span>(() =&gt; {
+  <span class="cf">console</span>.log(<span class="cs">"কাজ শেষ!"</span>);
+});</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 5 ===== -->
+<div class="phase p5" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৫</div>
+  <div class="phase-title">অ্যারে ও অবজেক্ট (Array &amp; Object)<span class="phase-sub">ডেটা সংগ্রহ ও সংগঠন</span></div>
+  <span class="phase-time">১-২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Array তৈরি ও অ্যাক্সেস <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> fruits = [<span class="cs">"আম"</span>, <span class="cs">"কলা"</span>, <span class="cs">"লিচু"</span>];
+<span class="cf">console</span>.log(fruits[<span class="cn">0</span>]);       <span class="cm">// আম</span>
+<span class="cf">console</span>.log(fruits.length);   <span class="cm">// 3</span>
+fruits.push(<span class="cs">"জাম"</span>);           <span class="cm">// শেষে যোগ</span>
+fruits.pop();                  <span class="cm">// শেষেরটা বাদ</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Array Methods: map, filter, reduce <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> nums = [<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">4</span>, <span class="cn">5</span>];
+
+<span class="cm">// map — প্রতিটি উপাদান বদলায়</span>
+<span class="ck">let</span> double = nums.map(n =&gt; n * <span class="cn">2</span>);
+<span class="cf">console</span>.log(double); <span class="cm">// [2,4,6,8,10]</span>
+
+<span class="cm">// filter — শর্ত মেনে নেয়</span>
+<span class="ck">let</span> jor = nums.filter(n =&gt; n % <span class="cn">2</span> === <span class="cn">0</span>);
+<span class="cf">console</span>.log(jor);    <span class="cm">// [2,4]</span>
+
+<span class="cm">// reduce — একটি মানে পরিণত করে</span>
+<span class="ck">let</span> yog = nums.reduce((acc, n) =&gt; acc + n, <span class="cn">0</span>);
+<span class="cf">console</span>.log(yog);    <span class="cm">// 15</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">for...of লুপ দিয়ে Array</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> fruits = [<span class="cs">"আম"</span>, <span class="cs">"কলা"</span>, <span class="cs">"লিচু"</span>];
+<span class="ck">for</span> (<span class="ck">let</span> fruit <span class="ck">of</span> fruits) {
+  <span class="cf">console</span>.log(fruit); <span class="cm">// আম, কলা, লিচু</span>
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Object তৈরি ও অ্যাক্সেস <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> student = {
+  naam: <span class="cs">"Rahim"</span>,
+  boyosh: <span class="cn">22</span>,
+  dept: <span class="cs">"CSE"</span>
+};
+<span class="cf">console</span>.log(student.naam);       <span class="cm">// Rahim</span>
+<span class="cf">console</span>.log(student[<span class="cs">"boyosh"</span>]); <span class="cm">// 22</span>
+student.gpa = <span class="cn">3.8</span>;              <span class="cm">// নতুন property</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Destructuring (Array ও Object) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">// Array Destructuring</span>
+<span class="ck">let</span> [a, b, c] = [<span class="cn">10</span>, <span class="cn">20</span>, <span class="cn">30</span>];
+<span class="cf">console</span>.log(a, b); <span class="cm">// 10 20</span>
+
+<span class="cm">// Object Destructuring</span>
+<span class="ck">let</span> { naam, boyosh } = { naam: <span class="cs">"Karim"</span>, boyosh: <span class="cn">25</span> };
+<span class="cf">console</span>.log(naam); <span class="cm">// Karim</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Spread Operator (...)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> arr1 = [<span class="cn">1</span>, <span class="cn">2</span>];
+<span class="ck">let</span> arr2 = [<span class="cn">3</span>, <span class="cn">4</span>];
+<span class="ck">let</span> merged = [...arr1, ...arr2];
+<span class="cf">console</span>.log(merged); <span class="cm">// [1,2,3,4]</span>
+
+<span class="ck">let</span> obj1 = { a: <span class="cn">1</span> };
+<span class="ck">let</span> obj2 = { ...obj1, b: <span class="cn">2</span> };
+<span class="cf">console</span>.log(obj2); <span class="cm">// {a:1, b:2}</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 6 ===== -->
+<div class="phase p6" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৬</div>
+  <div class="phase-title">DOM Manipulation<span class="phase-sub">ওয়েবপেজ পরিবর্তন করা</span></div>
+  <span class="phase-time">১-২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Element নির্বাচন <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">// ID দিয়ে</span>
+<span class="ck">let</span> el = document.<span class="cf">getElementById</span>(<span class="cs">"myId"</span>);
+
+<span class="cm">// CSS selector দিয়ে (সবচেয়ে সহজ)</span>
+<span class="ck">let</span> el2 = document.<span class="cf">querySelector</span>(<span class="cs">".myClass"</span>);
+<span class="ck">let</span> all = document.<span class="cf">querySelectorAll</span>(<span class="cs">"p"</span>);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Content ও Style পরিবর্তন <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> heading = document.<span class="cf">querySelector</span>(<span class="cs">"h1"</span>);
+
+heading.textContent = <span class="cs">"নতুন শিরোনাম"</span>;
+heading.innerHTML = <span class="cs">"&lt;b&gt;বোল্ড শিরোনাম&lt;/b&gt;"</span>;
+
+heading.style.color = <span class="cs">"#f7df1e"</span>;
+heading.style.fontSize = <span class="cs">"32px"</span>;
+heading.classList.<span class="cf">add</span>(<span class="cs">"active"</span>);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Event Listener <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ব্যবহারকারীর ক্লিক, টাইপ, স্ক্রল ইত্যাদিতে সাড়া দেওয়া।</p>
+    <pre><code><span class="ck">let</span> btn = document.<span class="cf">querySelector</span>(<span class="cs">"#myBtn"</span>);
+
+btn.<span class="cf">addEventListener</span>(<span class="cs">"click"</span>, () =&gt; {
+  <span class="cf">alert</span>(<span class="cs">"বাটনে ক্লিক করা হয়েছে!"</span>);
+});
+
+<span class="cm">// Input পরিবর্তনে</span>
+input.<span class="cf">addEventListener</span>(<span class="cs">"input"</span>, (e) =&gt; {
+  <span class="cf">console</span>.log(e.target.value);
+});</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Element তৈরি ও যোগ করা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> newItem = document.<span class="cf">createElement</span>(<span class="cs">"li"</span>);
+newItem.textContent = <span class="cs">"নতুন আইটেম"</span>;
+
+<span class="ck">let</span> list = document.<span class="cf">querySelector</span>(<span class="cs">"ul"</span>);
+list.<span class="cf">appendChild</span>(newItem); <span class="cm">// শেষে যোগ</span>
+<span class="cm">// list.removeChild(newItem); // বাদ দেওয়া</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 7 ===== -->
+<div class="phase p7" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৭</div>
+  <div class="phase-title">Asynchronous JS<span class="phase-sub">অ্যাসিঙ্ক্রোনাস প্রোগ্রামিং</span></div>
+  <span class="phase-time">১-২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">setTimeout ও setInterval</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">// নির্দিষ্ট সময় পরে একবার চলে</span>
+<span class="cf">setTimeout</span>(() =&gt; {
+  <span class="cf">console</span>.log(<span class="cs">"২ সেকেন্ড পরে!"</span>);
+}, <span class="cn">2000</span>);
+
+<span class="cm">// প্রতি সেকেন্ডে চলতে থাকে</span>
+<span class="ck">let</span> timer = <span class="cf">setInterval</span>(() =&gt; {
+  <span class="cf">console</span>.log(<span class="cs">"টিক!"</span>);
+}, <span class="cn">1000</span>);
+<span class="cm">// clearInterval(timer); // বন্ধ করতে</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Promise <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ভবিষ্যতে কোনো কাজ শেষ হলে কী করতে হবে তা বলে দেওয়া।</p>
+    <pre><code><span class="ck">let</span> promise = <span class="ck">new</span> <span class="cf">Promise</span>((resolve, reject) =&gt; {
+  <span class="ck">let</span> success = <span class="ck">true</span>;
+  <span class="ck">if</span> (success) <span class="cf">resolve</span>(<span class="cs">"সফল!"</span>);
+  <span class="ck">else</span> <span class="cf">reject</span>(<span class="cs">"ব্যর্থ!"</span>);
+});
+
+promise
+  .then(result =&gt; <span class="cf">console</span>.log(result))
+  .catch(err =&gt; <span class="cf">console</span>.log(err));</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">async / await <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Promise লেখার সহজ পদ্ধতি — অনেকটা সরল কোডের মতো দেখায়।</p>
+    <pre><code><span class="ck">async function</span> <span class="cf">data_nao</span>() {
+  <span class="ck">try</span> {
+    <span class="ck">let</span> res = <span class="ck">await</span> <span class="cf">fetch</span>(<span class="cs">"https://api.example.com/data"</span>);
+    <span class="ck">let</span> data = <span class="ck">await</span> res.<span class="cf">json</span>();
+    <span class="cf">console</span>.log(data);
+  } <span class="ck">catch</span> (err) {
+    <span class="cf">console</span>.log(<span class="cs">"ত্রুটি:"</span>, err);
+  }
+}
+<span class="cf">data_nao</span>();</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Fetch API দিয়ে ডেটা আনা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ইন্টারনেট থেকে ডেটা নিয়ে আসার আধুনিক পদ্ধতি।</p>
+    <pre><code><span class="ck">async function</span> <span class="cf">user_nao</span>() {
+  <span class="ck">let</span> res = <span class="ck">await</span> <span class="cf">fetch</span>(<span class="cs">"https://jsonplaceholder.typicode.com/users/1"</span>);
+  <span class="ck">let</span> user = <span class="ck">await</span> res.<span class="cf">json</span>();
+  <span class="cf">console</span>.log(user.name); <span class="cm">// Leanne Graham</span>
+}
+<span class="cf">user_nao</span>();</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 8 ===== -->
+<div class="phase p8" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৮</div>
+  <div class="phase-title">OOP (Object Oriented Programming)<span class="phase-sub">ক্লাস ও অবজেক্ট-ভিত্তিক প্রোগ্রামিং</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Class ও Constructor <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">class</span> <span class="cf">Student</span> {
+  <span class="cf">constructor</span>(naam, boyosh) {
+    <span class="ck">this</span>.naam = naam;
+    <span class="ck">this</span>.boyosh = boyosh;
+  }
+
+  <span class="cf">parichoy</span>() {
+    <span class="cf">console</span>.log(<span class="cs">`আমি ${this.naam}, বয়স ${this.boyosh}`</span>);
+  }
+}
+
+<span class="ck">let</span> s1 = <span class="ck">new</span> <span class="cf">Student</span>(<span class="cs">"Rahim"</span>, <span class="cn">22</span>);
+s1.<span class="cf">parichoy</span>(); <span class="cm">// আমি Rahim, বয়স 22</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Inheritance (extends ও super)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">class</span> <span class="cf">Animal</span> {
+  <span class="cf">constructor</span>(naam) { <span class="ck">this</span>.naam = naam; }
+  <span class="cf">dakao</span>() { <span class="cf">console</span>.log(<span class="cs">"..."</span>); }
+}
+
+<span class="ck">class</span> <span class="cf">Kukur</span> <span class="ck">extends</span> <span class="cf">Animal</span> {
+  <span class="cf">dakao</span>() { <span class="cf">console</span>.log(<span class="cs">"ঘেউ ঘেউ!"</span>); }
+}
+
+<span class="ck">let</span> dog = <span class="ck">new</span> <span class="cf">Kukur</span>(<span class="cs">"Tommy"</span>);
+dog.<span class="cf">dakao</span>(); <span class="cm">// ঘেউ ঘেউ!</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Prototype ও this কীওয়ার্ড <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>JS-এর প্রতিটি অবজেক্টের একটি Prototype থাকে — এটি JS-এর inheritance-এর মূল ভিত্তি।</p>
+    <pre><code><span class="ck">function</span> <span class="cf">Student</span>(naam) {
+  <span class="ck">this</span>.naam = naam;
+}
+Student.prototype.<span class="cf">greet</span> = <span class="ck">function</span>() {
+  <span class="cf">console</span>.log(<span class="cs">`হ্যালো, আমি ${this.naam}`</span>);
+};
+
+<span class="ck">let</span> s = <span class="ck">new</span> <span class="cf">Student</span>(<span class="cs">"Karim"</span>);
+s.<span class="cf">greet</span>(); <span class="cm">// হ্যালো, আমি Karim</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 9 ===== -->
+<div class="phase p9" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৯</div>
+  <div class="phase-title">আধুনিক JS (ES6+)<span class="phase-sub">নতুন ফিচার ও প্যাটার্ন</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Modules (import / export) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">// math.js ফাইলে</span>
+<span class="ck">export function</span> <span class="cf">yog</span>(a, b) { <span class="ck">return</span> a + b; }
+<span class="ck">export const</span> PI = <span class="cn">3.14159</span>;
+
+<span class="cm">// app.js ফাইলে</span>
+<span class="ck">import</span> { yog, PI } <span class="ck">from</span> <span class="cs">"./math.js"</span>;
+<span class="cf">console</span>.log(<span class="cf">yog</span>(<span class="cn">3</span>, <span class="cn">4</span>)); <span class="cm">// 7</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Optional Chaining (?.) ও Nullish Coalescing (??)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">let</span> user = { profile: { naam: <span class="cs">"Rahim"</span> } };
+
+<span class="cm">// ?. — না থাকলে error না দিয়ে undefined দেয়</span>
+<span class="cf">console</span>.log(user?.profile?.naam);  <span class="cm">// Rahim</span>
+<span class="cf">console</span>.log(user?.address?.city);  <span class="cm">// undefined</span>
+
+<span class="cm">// ?? — null/undefined হলে ডিফল্ট মান</span>
+<span class="ck">let</span> naam = user?.nickname ?? <span class="cs">"অজানা"</span>;
+<span class="cf">console</span>.log(naam); <span class="cm">// অজানা</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Map ও Set <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">// Map — key যেকোনো টাইপের হতে পারে</span>
+<span class="ck">let</span> map = <span class="ck">new</span> <span class="cf">Map</span>();
+map.<span class="cf">set</span>(<span class="cs">"naam"</span>, <span class="cs">"Rahim"</span>);
+<span class="cf">console</span>.log(map.<span class="cf">get</span>(<span class="cs">"naam"</span>)); <span class="cm">// Rahim</span>
+
+<span class="cm">// Set — ডুপ্লিকেট রাখে না</span>
+<span class="ck">let</span> set = <span class="ck">new</span> <span class="cf">Set</span>([<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">3</span>]);
+<span class="cf">console</span>.log([...set]); <span class="cm">// [1, 2, 3]</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Error Handling (try/catch) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">try</span> {
+  <span class="ck">let</span> x = JSON.<span class="cf">parse</span>(<span class="cs">"ভুল JSON"</span>);
+} <span class="ck">catch</span> (err) {
+  <span class="cf">console</span>.log(<span class="cs">"ত্রুটি:"</span>, err.message);
+} <span class="ck">finally</span> {
+  <span class="cf">console</span>.log(<span class="cs">"সবসময় চলে"</span>);
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">localStorage দিয়ে ডেটা সংরক্ষণ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ব্রাউজারে ডেটা সংরক্ষণ — পেজ রিফ্রেশ করলেও থাকে।</p>
+    <pre><code><span class="cm">// সংরক্ষণ</span>
+localStorage.<span class="cf">setItem</span>(<span class="cs">"naam"</span>, <span class="cs">"Rahim"</span>);
+
+<span class="cm">// পড়া</span>
+<span class="ck">let</span> naam = localStorage.<span class="cf">getItem</span>(<span class="cs">"naam"</span>);
+<span class="cf">console</span>.log(naam); <span class="cm">// Rahim</span>
+
+<span class="cm">// মুছা</span>
+localStorage.<span class="cf">removeItem</span>(<span class="cs">"naam"</span>);</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 10 ===== -->
+<div class="phase p10" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১০</div>
+  <div class="phase-title">স্পেশালাইজেশন — পথ বেছে নাও<span class="phase-sub">নিজের লক্ষ্য অনুযায়ী শাখা বেছে নিন</span></div>
+  <span class="phase-time">চলমান</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">⚛️ ফ্রন্টএন্ড → React / Vue / Angular</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">React</strong> — সবচেয়ে জনপ্রিয়, Meta তৈরি। <strong style="color:#f1f5f9">Vue</strong> — শেখা সহজ। <strong style="color:#f1f5f9">Angular</strong> — বড় প্রজেক্টের জন্য।</p>
+    <pre><code><span class="cm">// React-এর একটি সহজ Component</span>
+<span class="ck">function</span> <span class="cf">App</span>() {
+  <span class="ck">return</span> &lt;<span class="ck">h1</span>&gt;স্বাগতম React-এ!&lt;/<span class="ck">h1</span>&gt;;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🖥️ ব্যাকএন্ড → Node.js / Express.js</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>JS দিয়ে সার্ভার তৈরি করুন — একটাই ভাষায় ফ্রন্ট-ব্যাক দুটো!</p>
+    <pre><code><span class="ck">const</span> express = <span class="cf">require</span>(<span class="cs">"express"</span>);
+<span class="ck">const</span> app = <span class="cf">express</span>();
+
+app.<span class="cf">get</span>(<span class="cs">"/"</span>, (req, res) =&gt; {
+  res.<span class="cf">send</span>(<span class="cs">"স্বাগতম আমার API-তে!"</span>);
+});
+
+app.<span class="cf">listen</span>(<span class="cn">3000</span>);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">📱 মোবাইল অ্যাপ → React Native</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>JavaScript দিয়েই Android ও iOS অ্যাপ তৈরি করুন — একই কোডবেস!</p>
+    <pre><code><span class="ck">import</span> { Text, View } <span class="ck">from</span> <span class="cs">"react-native"</span>;
+<span class="ck">export default function</span> <span class="cf">App</span>() {
+  <span class="ck">return</span> (
+    &lt;<span class="ck">View</span>&gt;&lt;<span class="ck">Text</span>&gt;হ্যালো মোবাইল!&lt;/<span class="ck">Text</span>&gt;&lt;/<span class="ck">View</span>&gt;
+  );
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🎮 গেম ডেভেলপমেন্ট → Canvas API / Three.js</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">Canvas API</strong> — 2D গেম। <strong style="color:#f1f5f9">Three.js</strong> — 3D গ্রাফিক্স ও গেম।</p>
+    <pre><code><span class="ck">const</span> canvas = document.<span class="cf">querySelector</span>(<span class="cs">"canvas"</span>);
+<span class="ck">const</span> ctx = canvas.<span class="cf">getContext</span>(<span class="cs">"2d"</span>);
+ctx.fillStyle = <span class="cs">"#f7df1e"</span>;
+ctx.<span class="cf">fillRect</span>(<span class="cn">50</span>, <span class="cn">50</span>, <span class="cn">100</span>, <span class="cn">100</span>); <span class="cm">// হলুদ বর্গ</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+</div><!-- end timeline -->
+
+<div class="tip-box">
+  <h3>💡 শেখার টিপস</h3>
+  <ul>
+    <li>প্রতিদিন অন্তত ১ ঘণ্টা কোড লিখুন — শুধু পড়লে হবে না</li>
+    <li>ছোট ছোট প্রজেক্ট বানান — Calculator, Todo List, Quiz App</li>
+    <li>Browser Console আপনার সেরা বন্ধু — সবকিছু সেখানে টেস্ট করুন</li>
+    <li>MDN Web Docs (developer.mozilla.org) — সেরা রেফারেন্স</li>
+    <li>মোবাইলে Spck Editor অ্যাপে HTML+JS প্র্যাকটিস করুন</li>
+  </ul>
+</div>
+
+<script>
+function togglePhase(el) {
+  if (event.target.classList.contains('topic-check')) return;
+  if (event.target.closest('.topic-row')) return;
+  el.classList.toggle('open');
+}
+
+function toggleTopic(row) {
+  event.stopPropagation();
+  if (event.target.classList.contains('topic-check')) return;
+  const item = row.closest('.topic-item');
+  item.classList.toggle('open');
+}
+
+function doCheck(el, e) {
+  e.stopPropagation();
+  el.classList.toggle('checked');
+  updateProgress();
+}
+
+function updateProgress() {
+  const all = document.querySelectorAll('.topic-check').length;
+  const done = document.querySelectorAll('.topic-check.checked').length;
+  const pct = all > 0 ? Math.round((done / all) * 100) : 0;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = done + ' / ' + all + ' টপিক সম্পন্ন';
+}
+
+async function copyCode() {
+  const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(document.documentElement.outerHTML);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  } catch(e) {
+    const ta = document.createElement('textarea');
+    ta.value = document.documentElement.outerHTML;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  }
+}
+
+updateProgress();
+</script>
+
+
+</body></html>

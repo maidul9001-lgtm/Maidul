@@ -1,0 +1,1186 @@
+<html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HTML শেখার রোডম্যাপ</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Hind Siliguri', sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px 60px; }
+  .header { text-align: center; margin-bottom: 40px; }
+  .header .badge { display: inline-block; background: linear-gradient(135deg,#f97316,#ef4444); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px; }
+  .header h1 { font-size: clamp(26px,6vw,44px); font-weight: 700; color: #f1f5f9; line-height: 1.2; }
+  .header h1 span { background: linear-gradient(135deg,#f97316,#ef4444); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header p { margin-top: 10px; color: #94a3b8; font-size: 15px; }
+  .copy-wrap { max-width: 720px; margin: 0 auto 20px; display: flex; justify-content: flex-end; }
+  #copyBtn { display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg,#f97316,#ef4444); color: #fff; border: none; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-family: 'Hind Siliguri', sans-serif; font-weight: 600; cursor: pointer; transition: opacity .2s, transform .1s; }
+  #copyBtn:active { transform: scale(.96); opacity: .85; }
+  #copyBtn.done { background: linear-gradient(135deg,#3ecf8e,#10b981); }
+  .progress-bar-wrap { max-width: 720px; margin: 0 auto 28px; }
+  .progress-info { display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 6px; }
+  .progress-track { height: 6px; background: #1e1e32; border-radius: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg,#f97316,#ef4444); border-radius: 10px; transition: width .4s ease; width: 0%; }
+  .timeline { max-width: 720px; margin: 0 auto; position: relative; }
+  .timeline::before { content:''; position: absolute; left: 28px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom,#f9731644,#ef444444); }
+  .phase { margin-bottom: 8px; position: relative; }
+  .phase-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px 14px 68px; background: #1e1e32; border: 1px solid #2a2a45; border-radius: 12px; cursor: pointer; transition: background .2s, border-color .2s; position: relative; user-select: none; }
+  .phase-header:hover { background: #252540; border-color: #3a3a60; }
+  .phase-dot { position: absolute; left: -44px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 3px solid; background: #0f0f1a; z-index: 1; }
+  .phase-number { font-size: 11px; font-weight: 700; letter-spacing: 1px; min-width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-title { flex: 1; font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .phase-sub { font-size: 11px; color: #64748b; font-weight: 400; display: block; margin-top: 2px; }
+  .phase-time { font-size: 11px; color: #64748b; background: #1a1a2e; border: 1px solid #2a2a45; padding: 3px 8px; border-radius: 20px; white-space: nowrap; }
+  .chevron { font-size: 11px; color: #4a5568; transition: transform .3s; flex-shrink: 0; }
+  .phase.open .chevron { transform: rotate(180deg); }
+  .topics { display: none; padding: 0 0 8px 68px; }
+  .phase.open .topics { display: block; }
+  .topics-inner { background: #16162a; border: 1px solid #2a2a45; border-top: none; border-radius: 0 0 12px 12px; padding: 12px; }
+  .topic-item { margin-bottom: 6px; border-radius: 8px; overflow: hidden; }
+  .topic-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; cursor: pointer; transition: background .15s; }
+  .topic-row:hover { background: #1e1e32; }
+  .topic-check { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #3a3a60; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; transition: all .2s; }
+  .topic-check.checked { border-color: #f97316; background: #f9731622; }
+  .topic-check.checked::after { content: '✓'; font-size: 11px; color: #f97316; font-weight: 700; }
+  .topic-text { font-size: 14px; color: #cbd5e1; line-height: 1.5; flex: 1; }
+  .topic-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .tag-imp { background: #f9731622; color: #fb923c; border: 1px solid #f9731644; }
+  .tag-pro { background: #0369a122; color: #38bdf8; border: 1px solid #0369a144; }
+  .expand-icon { font-size: 10px; color: #4a5568; flex-shrink: 0; margin-top: 3px; transition: transform .2s; }
+  .topic-item.open .expand-icon { transform: rotate(90deg); }
+  .topic-detail { display: none; padding: 0 10px 12px 38px; }
+  .topic-item.open .topic-detail { display: block; }
+  .detail-box { background: #0f0f1a; border: 1px solid #2a2a45; border-radius: 8px; padding: 12px 14px; }
+  .detail-box p { font-size: 13px; color: #94a3b8; line-height: 1.7; margin-bottom: 8px; }
+  .detail-box p:last-child { margin-bottom: 0; }
+  pre { background: #1a1a2e; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin-top: 8px; }
+  code { font-family: 'Courier New', monospace; font-size: 12px; color: #7dd3fc; line-height: 1.6; white-space: pre; }
+  .ct { color: #f87171; }
+  .ca { color: #fbbf24; }
+  .cv { color: #86efac; }
+  .cm { color: #475569; }
+  .p1 .phase-dot{border-color:#f59e0b} .p1 .phase-number{background:#f59e0b22;color:#f59e0b}
+  .p2 .phase-dot{border-color:#f97316} .p2 .phase-number{background:#f9731622;color:#f97316}
+  .p3 .phase-dot{border-color:#ef4444} .p3 .phase-number{background:#ef444422;color:#ef4444}
+  .p4 .phase-dot{border-color:#ec4899} .p4 .phase-number{background:#ec489922;color:#ec4899}
+  .p5 .phase-dot{border-color:#8b5cf6} .p5 .phase-number{background:#8b5cf622;color:#8b5cf6}
+  .p6 .phase-dot{border-color:#3b82f6} .p6 .phase-number{background:#3b82f622;color:#3b82f6}
+  .p7 .phase-dot{border-color:#10b981} .p7 .phase-number{background:#10b98122;color:#10b981}
+  .p8 .phase-dot{border-color:#06b6d4} .p8 .phase-number{background:#06b6d422;color:#06b6d4}
+  .tip-box { max-width: 720px; margin: 28px auto 0; background: #16162a; border: 1px solid #2a2a45; border-left: 3px solid #f97316; border-radius: 10px; padding: 16px 20px; }
+  .tip-box h3 { font-size: 14px; color: #f97316; margin-bottom: 8px; }
+  .tip-box ul { list-style: none; }
+  .tip-box li { font-size: 13px; color: #94a3b8; padding: 4px 0; }
+  .tip-box li::before { content: '→ '; color: #f97316; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="header">
+  <div class="badge">🌐 Complete Roadmap</div>
+  <h1>HTML শেখার <span>A to Z গাইড</span></h1>
+  <p>প্রতিটি টপিকে ব্যাখ্যা ও কোড উদাহরণ সহ — ক্লিক করে বিস্তারিত দেখুন</p>
+</div>
+
+<div class="copy-wrap">
+  <button id="copyBtn" onclick="copyCode()">📋 HTML কোড কপি করুন</button>
+</div>
+
+<div class="progress-bar-wrap">
+  <div class="progress-info"><span>অগ্রগতি</span><span id="prog-text">0 / 27 টপিক সম্পন্ন</span></div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill" style="width: 0%;"></div></div>
+</div>
+
+<div class="timeline">
+
+<!-- PHASE 1 -->
+<div class="phase p1" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১</div>
+  <div class="phase-title">শুরুর প্রস্তুতি (Setup)<span class="phase-sub">HTML কী ও পরিবেশ তৈরি</span></div>
+  <span class="phase-time">১ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">HTML কী এবং কীভাবে কাজ করে?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>HTML (HyperText Markup Language) হলো ওয়েবপেজের কাঠামো তৈরির ভাষা। ব্রাউজার HTML পড়ে এবং সুন্দরভাবে দেখায়।</p>
+    <p>HTML → ওয়েবপেজের <strong style="color:#f1f5f9">কাঠামো</strong> | CSS → <strong style="color:#f1f5f9">সৌন্দর্য</strong> | JavaScript → <strong style="color:#f1f5f9">কার্যকারিতা</strong></p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">VS Code সেটআপ ও প্রথম ফাইল তৈরি</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>VS Code ডাউনলোড করুন → <strong style="color:#f1f5f9">Live Server</strong> এক্সটেনশন ইনস্টল করুন → নতুন ফাইল তৈরি করুন <strong style="color:#fbbf24">index.html</strong> নামে।</p>
+    <p>মোবাইলে কাজ করতে <strong style="color:#f97316">Spck Code Editor</strong> বা <strong style="color:#f97316">Acode</strong> অ্যাপ ব্যবহার করুন।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">প্রথম HTML পেজ তৈরি <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>VS Code-এ <strong style="color:#fbbf24">!</strong> টাইপ করে Enter চাপলে নিচের কোড স্বয়ংক্রিয় আসে:</p>
+    <pre><code><span class="cm">&lt;!-- প্রতিটি HTML ফাইলের মূল কাঠামো --&gt;</span>
+<span class="ct">&lt;!DOCTYPE html&gt;</span>
+<span class="ct">&lt;html</span> <span class="ca">lang</span>=<span class="cv">"bn"</span><span class="ct">&gt;</span>
+<span class="ct">&lt;head&gt;</span>
+  <span class="ct">&lt;meta</span> <span class="ca">charset</span>=<span class="cv">"UTF-8"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;title&gt;</span>আমার প্রথম পেজ<span class="ct">&lt;/title&gt;</span>
+<span class="ct">&lt;/head&gt;</span>
+<span class="ct">&lt;body&gt;</span>
+  <span class="ct">&lt;h1&gt;</span>স্বাগতম!<span class="ct">&lt;/h1&gt;</span>
+<span class="ct">&lt;/body&gt;</span>
+<span class="ct">&lt;/html&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ট্যাগ, এলিমেন্ট ও অ্যাট্রিবিউট কী?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f87171">ট্যাগ</strong> → &lt;p&gt; এর মতো চিহ্ন | <strong style="color:#fbbf24">অ্যাট্রিবিউট</strong> → ট্যাগের অতিরিক্ত তথ্য | <strong style="color:#86efac">এলিমেন্ট</strong> → শুরু + শেষ ট্যাগ + মাঝের সব</p>
+    <pre><code><span class="cm">&lt;!-- সাধারণ ট্যাগ --&gt;</span>
+<span class="ct">&lt;p&gt;</span>এটি একটি প্যারাগ্রাফ<span class="ct">&lt;/p&gt;</span>
+
+<span class="cm">&lt;!-- অ্যাট্রিবিউট: name="value" --&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"https://google.com"</span><span class="ct">&gt;</span>গুগল<span class="ct">&lt;/a&gt;</span>
+
+<span class="cm">&lt;!-- self-closing ট্যাগ (বন্ধ লাগে না) --&gt;</span>
+<span class="ct">&lt;img</span> <span class="ca">src</span>=<span class="cv">"photo.jpg"</span> <span class="ca">alt</span>=<span class="cv">"ছবি"</span><span class="ct">&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase p2 open" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">২</div>
+  <div class="phase-title">টেক্সট ও হেডিং<span class="phase-sub">লেখা ফরম্যাট করা</span></div>
+  <span class="phase-time">২-৩ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">হেডিং ট্যাগ: h1 থেকে h6 <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>h1 সবচেয়ে বড়, h6 সবচেয়ে ছোট। প্রতিটি পেজে মাত্র একটি h1 ব্যবহার করুন (SEO-র জন্য)।</p>
+    <pre><code><span class="ct">&lt;h1&gt;</span>সবচেয়ে বড় শিরোনাম<span class="ct">&lt;/h1&gt;</span>
+<span class="ct">&lt;h2&gt;</span>দ্বিতীয় শিরোনাম<span class="ct">&lt;/h2&gt;</span>
+<span class="ct">&lt;h3&gt;</span>তৃতীয় শিরোনাম<span class="ct">&lt;/h3&gt;</span>
+<span class="ct">&lt;h4&gt;</span>চতুর্থ শিরোনাম<span class="ct">&lt;/h4&gt;</span>
+<span class="ct">&lt;h5&gt;</span>পঞ্চম শিরোনাম<span class="ct">&lt;/h5&gt;</span>
+<span class="ct">&lt;h6&gt;</span>সবচেয়ে ছোট শিরোনাম<span class="ct">&lt;/h6&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">প্যারাগ্রাফ, লাইন ব্রেক ও hr</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;p&gt;</span>এটি একটি প্যারাগ্রাফ।<span class="ct">&lt;/p&gt;</span>
+
+<span class="ct">&lt;p&gt;</span>এই লাইনের পর<span class="ct">&lt;br&gt;</span>নতুন লাইন শুরু।<span class="ct">&lt;/p&gt;</span>
+
+<span class="ct">&lt;hr&gt;</span> <span class="cm">&lt;!-- অনুভূমিক রেখা --&gt;</span>
+
+<span class="ct">&lt;p&gt;</span>রেখার নিচে নতুন অনুচ্ছেদ।<span class="ct">&lt;/p&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">টেক্সট ফরম্যাটিং: bold, italic, underline</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;b&gt;</span>মোটা লেখা (bold)<span class="ct">&lt;/b&gt;</span>
+<span class="ct">&lt;strong&gt;</span>গুরুত্বপূর্ণ মোটা<span class="ct">&lt;/strong&gt;</span>
+
+<span class="ct">&lt;i&gt;</span>তির্যক লেখা (italic)<span class="ct">&lt;/i&gt;</span>
+<span class="ct">&lt;em&gt;</span>জোর দেওয়া italic<span class="ct">&lt;/em&gt;</span>
+
+<span class="ct">&lt;u&gt;</span>আন্ডারলাইন<span class="ct">&lt;/u&gt;</span>
+<span class="ct">&lt;mark&gt;</span>হাইলাইট করা<span class="ct">&lt;/mark&gt;</span>
+<span class="ct">&lt;del&gt;</span>কাটা লেখা<span class="ct">&lt;/del&gt;</span>
+<span class="ct">&lt;small&gt;</span>ছোট লেখা<span class="ct">&lt;/small&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">কমেন্ট লেখা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>কমেন্ট ব্রাউজারে দেখায় না — শুধু কোডারের নোটের জন্য।</p>
+    <pre><code><span class="cm">&lt;!-- এটি কমেন্ট, ব্রাউজারে দেখাবে না --&gt;</span>
+<span class="ct">&lt;p&gt;</span>এটি দেখাবে।<span class="ct">&lt;/p&gt;</span>
+<span class="cm">&lt;!-- TODO: এখানে ছবি যোগ করতে হবে --&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase p3" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৩</div>
+  <div class="phase-title">লিংক ও ছবি<span class="phase-sub">a ট্যাগ ও img ট্যাগ</span></div>
+  <span class="phase-time">২-৩ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">লিংক তৈরি: &lt;a&gt; ট্যাগ <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">&lt;!-- বাইরের লিংক, নতুন ট্যাবে খুলবে --&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"https://google.com"</span> <span class="ca">target</span>=<span class="cv">"_blank"</span><span class="ct">&gt;</span>
+  গুগলে যান
+<span class="ct">&lt;/a&gt;</span>
+
+<span class="cm">&lt;!-- একই ফোল্ডারের পেজে লিংক --&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"about.html"</span><span class="ct">&gt;</span>আমাদের সম্পর্কে<span class="ct">&lt;/a&gt;</span>
+
+<span class="cm">&lt;!-- ইমেইল ও ফোন লিংক --&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"mailto:name@email.com"</span><span class="ct">&gt;</span>ইমেইল করুন<span class="ct">&lt;/a&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"tel:+8801700000000"</span><span class="ct">&gt;</span>কল করুন<span class="ct">&lt;/a&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ছবি যোগ করা: &lt;img&gt; ট্যাগ <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#fbbf24">src</strong> — ছবির পথ। <strong style="color:#fbbf24">alt</strong> — ছবি না লোড হলে কী দেখাবে (SEO-র জন্যও গুরুত্বপূর্ণ)।</p>
+    <pre><code><span class="cm">&lt;!-- একই ফোল্ডারের ছবি --&gt;</span>
+<span class="ct">&lt;img</span> <span class="ca">src</span>=<span class="cv">"photo.jpg"</span> <span class="ca">alt</span>=<span class="cv">"আমার ছবি"</span><span class="ct">&gt;</span>
+
+<span class="cm">&lt;!-- সাইজ নির্দিষ্ট করা --&gt;</span>
+<span class="ct">&lt;img</span> <span class="ca">src</span>=<span class="cv">"logo.png"</span>
+     <span class="ca">alt</span>=<span class="cv">"লোগো"</span>
+     <span class="ca">width</span>=<span class="cv">"200"</span>
+     <span class="ca">height</span>=<span class="cv">"100"</span><span class="ct">&gt;</span>
+
+<span class="cm">&lt;!-- ইন্টারনেটের ছবি --&gt;</span>
+<span class="ct">&lt;img</span> <span class="ca">src</span>=<span class="cv">"https://example.com/img.jpg"</span>
+     <span class="ca">alt</span>=<span class="cv">"বাইরের ছবি"</span><span class="ct">&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">পেজের ভেতরে নোঙর লিংক (Anchor)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>একই পেজের কোনো অংশে লাফ দিয়ে যাওয়ার জন্য।</p>
+    <pre><code><span class="cm">&lt;!-- উপরে মেনুতে লিংক --&gt;</span>
+<span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"#contact"</span><span class="ct">&gt;</span>যোগাযোগে যান<span class="ct">&lt;/a&gt;</span>
+
+<span class="cm">&lt;!-- নিচে সেকশনে id দিন --&gt;</span>
+<span class="ct">&lt;section</span> <span class="ca">id</span>=<span class="cv">"contact"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;h2&gt;</span>যোগাযোগ<span class="ct">&lt;/h2&gt;</span>
+<span class="ct">&lt;/section&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase p4" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৪</div>
+  <div class="phase-title">লিস্ট ও টেবিল<span class="phase-sub">তালিকা ও ছক তৈরি</span></div>
+  <span class="phase-time">৩-৪ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">অর্ডার ও আনঅর্ডার লিস্ট <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">&lt;!-- বুলেট লিস্ট --&gt;</span>
+<span class="ct">&lt;ul&gt;</span>
+  <span class="ct">&lt;li&gt;</span>আম<span class="ct">&lt;/li&gt;</span>
+  <span class="ct">&lt;li&gt;</span>কলা<span class="ct">&lt;/li&gt;</span>
+  <span class="ct">&lt;li&gt;</span>আপেল<span class="ct">&lt;/li&gt;</span>
+<span class="ct">&lt;/ul&gt;</span>
+
+<span class="cm">&lt;!-- নম্বর লিস্ট --&gt;</span>
+<span class="ct">&lt;ol&gt;</span>
+  <span class="ct">&lt;li&gt;</span>প্রথমে HTML<span class="ct">&lt;/li&gt;</span>
+  <span class="ct">&lt;li&gt;</span>তারপর CSS<span class="ct">&lt;/li&gt;</span>
+  <span class="ct">&lt;li&gt;</span>শেষে JavaScript<span class="ct">&lt;/li&gt;</span>
+<span class="ct">&lt;/ol&gt;</span>
+
+<span class="cm">&lt;!-- লিস্টের ভেতরে লিস্ট --&gt;</span>
+<span class="ct">&lt;ul&gt;</span>
+  <span class="ct">&lt;li&gt;</span>ফল
+    <span class="ct">&lt;ul&gt;</span>
+      <span class="ct">&lt;li&gt;</span>আম<span class="ct">&lt;/li&gt;</span>
+      <span class="ct">&lt;li&gt;</span>কলা<span class="ct">&lt;/li&gt;</span>
+    <span class="ct">&lt;/ul&gt;</span>
+  <span class="ct">&lt;/li&gt;</span>
+<span class="ct">&lt;/ul&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">টেবিল তৈরি <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f87171">table</strong> → মূল ছক | <strong style="color:#fbbf24">tr</strong> → সারি | <strong style="color:#86efac">th</strong> → হেডার ঘর | <strong style="color:#c084fc">td</strong> → সাধারণ ঘর</p>
+    <pre><code><span class="ct">&lt;table</span> <span class="ca">border</span>=<span class="cv">"1"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;tr&gt;</span>
+    <span class="ct">&lt;th&gt;</span>নাম<span class="ct">&lt;/th&gt;</span>
+    <span class="ct">&lt;th&gt;</span>বয়স<span class="ct">&lt;/th&gt;</span>
+    <span class="ct">&lt;th&gt;</span>শহর<span class="ct">&lt;/th&gt;</span>
+  <span class="ct">&lt;/tr&gt;</span>
+  <span class="ct">&lt;tr&gt;</span>
+    <span class="ct">&lt;td&gt;</span>Maidul<span class="ct">&lt;/td&gt;</span>
+    <span class="ct">&lt;td&gt;</span>25<span class="ct">&lt;/td&gt;</span>
+    <span class="ct">&lt;td&gt;</span>Gazipur<span class="ct">&lt;/td&gt;</span>
+  <span class="ct">&lt;/tr&gt;</span>
+  <span class="ct">&lt;tr&gt;</span>
+    <span class="ct">&lt;td&gt;</span>Rahim<span class="ct">&lt;/td&gt;</span>
+    <span class="ct">&lt;td&gt;</span>30<span class="ct">&lt;/td&gt;</span>
+    <span class="ct">&lt;td&gt;</span>Dhaka<span class="ct">&lt;/td&gt;</span>
+  <span class="ct">&lt;/tr&gt;</span>
+<span class="ct">&lt;/table&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">colspan ও rowspan দিয়ে ঘর মেলানো</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;table</span> <span class="ca">border</span>=<span class="cv">"1"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;tr&gt;</span>
+    <span class="cm">&lt;!-- colspan: ২টি কলাম একসাথে --&gt;</span>
+    <span class="ct">&lt;td</span> <span class="ca">colspan</span>=<span class="cv">"2"</span><span class="ct">&gt;</span>বড় ঘর (২ কলাম)<span class="ct">&lt;/td&gt;</span>
+  <span class="ct">&lt;/tr&gt;</span>
+  <span class="ct">&lt;tr&gt;</span>
+    <span class="cm">&lt;!-- rowspan: ২টি সারি একসাথে --&gt;</span>
+    <span class="ct">&lt;td</span> <span class="ca">rowspan</span>=<span class="cv">"2"</span><span class="ct">&gt;</span>লম্বা ঘর<span class="ct">&lt;/td&gt;</span>
+    <span class="ct">&lt;td&gt;</span>সাধারণ<span class="ct">&lt;/td&gt;</span>
+  <span class="ct">&lt;/tr&gt;</span>
+<span class="ct">&lt;/table&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 5 -->
+<div class="phase p5" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৫</div>
+  <div class="phase-title">ফর্ম ও ইনপুট<span class="phase-sub">ব্যবহারকারীর তথ্য নেওয়া</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ফর্ম তৈরির মূল কাঠামো <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;form</span> <span class="ca">action</span>=<span class="cv">"submit.php"</span> <span class="ca">method</span>=<span class="cv">"post"</span><span class="ct">&gt;</span>
+
+  <span class="ct">&lt;label</span> <span class="ca">for</span>=<span class="cv">"naam"</span><span class="ct">&gt;</span>নাম:<span class="ct">&lt;/label&gt;</span>
+  <span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"text"</span> <span class="ca">id</span>=<span class="cv">"naam"</span>
+         <span class="ca">name</span>=<span class="cv">"naam"</span>
+         <span class="ca">placeholder</span>=<span class="cv">"আপনার নাম লিখুন"</span><span class="ct">&gt;</span>
+
+  <span class="ct">&lt;label</span> <span class="ca">for</span>=<span class="cv">"email"</span><span class="ct">&gt;</span>ইমেইল:<span class="ct">&lt;/label&gt;</span>
+  <span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"email"</span> <span class="ca">id</span>=<span class="cv">"email"</span>
+         <span class="ca">name</span>=<span class="cv">"email"</span> <span class="ca">required</span><span class="ct">&gt;</span>
+
+  <span class="ct">&lt;button</span> <span class="ca">type</span>=<span class="cv">"submit"</span><span class="ct">&gt;</span>জমা দিন<span class="ct">&lt;/button&gt;</span>
+<span class="ct">&lt;/form&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">সব ধরনের input type <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"text"</span><span class="ct">&gt;</span>      <span class="cm">&lt;!-- সাধারণ লেখা --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"password"</span><span class="ct">&gt;</span>  <span class="cm">&lt;!-- পাসওয়ার্ড (লুকানো) --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"email"</span><span class="ct">&gt;</span>     <span class="cm">&lt;!-- ইমেইল যাচাই করে --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"number"</span><span class="ct">&gt;</span>    <span class="cm">&lt;!-- শুধু সংখ্যা --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"tel"</span><span class="ct">&gt;</span>       <span class="cm">&lt;!-- ফোন নম্বর --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"date"</span><span class="ct">&gt;</span>      <span class="cm">&lt;!-- তারিখ পিকার --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"checkbox"</span><span class="ct">&gt;</span>  <span class="cm">&lt;!-- টিক বাক্স --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"radio"</span><span class="ct">&gt;</span>     <span class="cm">&lt;!-- একটি বেছে নেওয়া --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"file"</span><span class="ct">&gt;</span>      <span class="cm">&lt;!-- ফাইল আপলোড --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"range"</span><span class="ct">&gt;</span>     <span class="cm">&lt;!-- স্লাইডার --&gt;</span>
+<span class="ct">&lt;input</span> <span class="ca">type</span>=<span class="cv">"color"</span><span class="ct">&gt;</span>     <span class="cm">&lt;!-- রঙ পিকার --&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">textarea, select, option</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">&lt;!-- বড় টেক্সট বাক্স --&gt;</span>
+<span class="ct">&lt;textarea</span> <span class="ca">rows</span>=<span class="cv">"5"</span> <span class="ca">cols</span>=<span class="cv">"30"</span><span class="ct">&gt;</span>
+  এখানে লিখুন...
+<span class="ct">&lt;/textarea&gt;</span>
+
+<span class="cm">&lt;!-- ড্রপডাউন মেনু --&gt;</span>
+<span class="ct">&lt;select</span> <span class="ca">name</span>=<span class="cv">"jela"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;option</span> <span class="ca">value</span>=<span class="cv">"dhaka"</span><span class="ct">&gt;</span>ঢাকা<span class="ct">&lt;/option&gt;</span>
+  <span class="ct">&lt;option</span> <span class="ca">value</span>=<span class="cv">"gazipur"</span><span class="ct">&gt;</span>গাজীপুর<span class="ct">&lt;/option&gt;</span>
+  <span class="ct">&lt;option</span> <span class="ca">value</span>=<span class="cv">"ctg"</span><span class="ct">&gt;</span>চট্টগ্রাম<span class="ct">&lt;/option&gt;</span>
+<span class="ct">&lt;/select&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 6 -->
+<div class="phase p6" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৬</div>
+  <div class="phase-title">Semantic HTML<span class="phase-sub">অর্থবহ ট্যাগ ব্যবহার</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Semantic ট্যাগ কী এবং কেন? <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Semantic ট্যাগ ব্রাউজার ও Google-কে বলে দেয় কোন অংশের কী কাজ। SEO-র জন্য অনেক গুরুত্বপূর্ণ।</p>
+    <pre><code><span class="ct">&lt;header&gt;</span>  <span class="cm">&lt;!-- উপরের অংশ, লোগো, মেনু --&gt;</span>
+<span class="ct">&lt;nav&gt;</span>     <span class="cm">&lt;!-- নেভিগেশন মেনু --&gt;</span>
+<span class="ct">&lt;main&gt;</span>    <span class="cm">&lt;!-- মূল কন্টেন্ট --&gt;</span>
+<span class="ct">&lt;section&gt;</span> <span class="cm">&lt;!-- একটি বিভাগ --&gt;</span>
+<span class="ct">&lt;article&gt;</span> <span class="cm">&lt;!-- স্বাধীন লেখা/ব্লগ পোস্ট --&gt;</span>
+<span class="ct">&lt;aside&gt;</span>   <span class="cm">&lt;!-- পাশের তথ্য, বিজ্ঞাপন --&gt;</span>
+<span class="ct">&lt;footer&gt;</span>  <span class="cm">&lt;!-- নিচের অংশ --&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">div ও span — সাধারণ কন্টেইনার</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f87171">div</strong> — block level (পুরো লাইন নেয়) | <strong style="color:#fbbf24">span</strong> — inline (লেখার মাঝে ব্যবহার)</p>
+    <pre><code><span class="cm">&lt;!-- div: CSS দিয়ে গ্রুপ করতে --&gt;</span>
+<span class="ct">&lt;div</span> <span class="ca">class</span>=<span class="cv">"card"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;h2&gt;</span>কার্ড শিরোনাম<span class="ct">&lt;/h2&gt;</span>
+  <span class="ct">&lt;p&gt;</span>কার্ডের বিষয়বস্তু<span class="ct">&lt;/p&gt;</span>
+<span class="ct">&lt;/div&gt;</span>
+
+<span class="cm">&lt;!-- span: লেখার মাঝে রঙ দিতে --&gt;</span>
+<span class="ct">&lt;p&gt;</span>এখানে
+  <span class="ct">&lt;span</span> <span class="ca">style</span>=<span class="cv">"color:red"</span><span class="ct">&gt;</span>লাল<span class="ct">&lt;/span&gt;</span>
+  রঙের লেখা।
+<span class="ct">&lt;/p&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">সম্পূর্ণ পেজ লেআউট উদাহরণ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;body&gt;</span>
+  <span class="ct">&lt;header&gt;</span>
+    <span class="ct">&lt;h1&gt;</span>আমার ওয়েবসাইট<span class="ct">&lt;/h1&gt;</span>
+    <span class="ct">&lt;nav&gt;</span>
+      <span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"#"</span><span class="ct">&gt;</span>হোম<span class="ct">&lt;/a&gt;</span>
+      <span class="ct">&lt;a</span> <span class="ca">href</span>=<span class="cv">"#about"</span><span class="ct">&gt;</span>সম্পর্কে<span class="ct">&lt;/a&gt;</span>
+    <span class="ct">&lt;/nav&gt;</span>
+  <span class="ct">&lt;/header&gt;</span>
+
+  <span class="ct">&lt;main&gt;</span>
+    <span class="ct">&lt;section</span> <span class="ca">id</span>=<span class="cv">"about"</span><span class="ct">&gt;</span>
+      <span class="ct">&lt;h2&gt;</span>আমাদের সম্পর্কে<span class="ct">&lt;/h2&gt;</span>
+      <span class="ct">&lt;p&gt;</span>আমরা একটি প্রযুক্তি প্রতিষ্ঠান।<span class="ct">&lt;/p&gt;</span>
+    <span class="ct">&lt;/section&gt;</span>
+  <span class="ct">&lt;/main&gt;</span>
+
+  <span class="ct">&lt;footer&gt;</span>
+    <span class="ct">&lt;p&gt;</span>© 2024 আমার ওয়েবসাইট<span class="ct">&lt;/p&gt;</span>
+  <span class="ct">&lt;/footer&gt;</span>
+<span class="ct">&lt;/body&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 7 -->
+<div class="phase p7" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৭</div>
+  <div class="phase-title">মিডিয়া ও এম্বেড<span class="phase-sub">ভিডিও, অডিও, YouTube</span></div>
+  <span class="phase-time">২-৩ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ভিডিও যোগ করা: &lt;video&gt;</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;video</span> <span class="ca">width</span>=<span class="cv">"400"</span> <span class="ca">controls</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;source</span> <span class="ca">src</span>=<span class="cv">"video.mp4"</span> <span class="ca">type</span>=<span class="cv">"video/mp4"</span><span class="ct">&gt;</span>
+  আপনার ব্রাউজার ভিডিও সাপোর্ট করে না।
+<span class="ct">&lt;/video&gt;</span>
+
+<span class="cm">&lt;!-- autoplay, muted, loop অ্যাট্রিবিউট --&gt;</span>
+<span class="ct">&lt;video</span> <span class="ca">autoplay</span> <span class="ca">muted</span> <span class="ca">loop</span> <span class="ca">width</span>=<span class="cv">"100%"</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;source</span> <span class="ca">src</span>=<span class="cv">"bg-video.mp4"</span> <span class="ca">type</span>=<span class="cv">"video/mp4"</span><span class="ct">&gt;</span>
+<span class="ct">&lt;/video&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">অডিও যোগ করা: &lt;audio&gt;</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ct">&lt;audio</span> <span class="ca">controls</span><span class="ct">&gt;</span>
+  <span class="ct">&lt;source</span> <span class="ca">src</span>=<span class="cv">"song.mp3"</span> <span class="ca">type</span>=<span class="cv">"audio/mpeg"</span><span class="ct">&gt;</span>
+  আপনার ব্রাউজার অডিও সাপোর্ট করে না।
+<span class="ct">&lt;/audio&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">YouTube ও Google Maps এম্বেড</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>YouTube ভিডিওতে Share → Embed ক্লিক করলে iframe কোড পাবেন।</p>
+    <pre><code><span class="cm">&lt;!-- YouTube ভিডিও --&gt;</span>
+<span class="ct">&lt;iframe</span>
+  <span class="ca">width</span>=<span class="cv">"560"</span>
+  <span class="ca">height</span>=<span class="cv">"315"</span>
+  <span class="ca">src</span>=<span class="cv">"https://www.youtube.com/embed/VIDEO_ID"</span>
+  <span class="ca">allowfullscreen</span><span class="ct">&gt;</span>
+<span class="ct">&lt;/iframe&gt;</span>
+
+<span class="cm">&lt;!-- Google Maps --&gt;</span>
+<span class="ct">&lt;iframe</span>
+  <span class="ca">src</span>=<span class="cv">"https://maps.google.com/maps?q=Gazipur&amp;output=embed"</span>
+  <span class="ca">width</span>=<span class="cv">"100%"</span> <span class="ca">height</span>=<span class="cv">"300"</span><span class="ct">&gt;</span>
+<span class="ct">&lt;/iframe&gt;</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 8 -->
+<div class="phase p8" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৮</div>
+  <div class="phase-title">Meta, CSS ও পরবর্তী ধাপ<span class="phase-sub">SEO, CSS লিংক, JavaScript</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">meta ট্যাগ ও SEO <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>meta ট্যাগ Google ও ব্রাউজারকে পেজ সম্পর্কে তথ্য দেয়।</p>
+    <pre><code><span class="ct">&lt;head&gt;</span>
+  <span class="ct">&lt;meta</span> <span class="ca">charset</span>=<span class="cv">"UTF-8"</span><span class="ct">&gt;</span>
+
+  <span class="cm">&lt;!-- মোবাইলে সঠিক দেখানোর জন্য --&gt;</span>
+  <span class="ct">&lt;meta</span> <span class="ca">name</span>=<span class="cv">"viewport"</span>
+        <span class="ca">content</span>=<span class="cv">"width=device-width, initial-scale=1"</span><span class="ct">&gt;</span>
+
+  <span class="cm">&lt;!-- Google সার্চে বিবরণ --&gt;</span>
+  <span class="ct">&lt;meta</span> <span class="ca">name</span>=<span class="cv">"description"</span>
+        <span class="ca">content</span>=<span class="cv">"আমার ওয়েবসাইটের বিবরণ"</span><span class="ct">&gt;</span>
+
+  <span class="ct">&lt;title&gt;</span>আমার পেজ | সাইটের নাম<span class="ct">&lt;/title&gt;</span>
+<span class="ct">&lt;/head&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">CSS লিংক করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>HTML-এ CSS যোগ করার ৩টি উপায়:</p>
+    <pre><code><span class="cm">&lt;!-- ১. বাইরের ফাইল (সেরা পদ্ধতি) --&gt;</span>
+<span class="ct">&lt;link</span> <span class="ca">rel</span>=<span class="cv">"stylesheet"</span> <span class="ca">href</span>=<span class="cv">"style.css"</span><span class="ct">&gt;</span>
+
+<span class="cm">&lt;!-- ২. head-এর ভেতরে style ব্লক --&gt;</span>
+<span class="ct">&lt;style&gt;</span>
+  body { background: #fff; color: #333; }
+<span class="ct">&lt;/style&gt;</span>
+
+<span class="cm">&lt;!-- ৩. সরাসরি ট্যাগে (এড়িয়ে চলুন) --&gt;</span>
+<span class="ct">&lt;p</span> <span class="ca">style</span>=<span class="cv">"color: red;"</span><span class="ct">&gt;</span>লাল লেখা<span class="ct">&lt;/p&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">JavaScript লিংক করা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">&lt;!-- body-র একদম শেষে রাখুন --&gt;</span>
+<span class="ct">&lt;script</span> <span class="ca">src</span>=<span class="cv">"script.js"</span><span class="ct">&gt;&lt;/script&gt;</span>
+
+<span class="cm">&lt;!-- অথবা সরাসরি লেখা --&gt;</span>
+<span class="ct">&lt;script&gt;</span>
+  alert(<span class="cv">"স্বাগতম!"</span>);
+  document.getElementById(<span class="cv">"btn"</span>)
+    .addEventListener(<span class="cv">"click"</span>, function() {
+      alert(<span class="cv">"বাটন চাপা হয়েছে!"</span>);
+    });
+<span class="ct">&lt;/script&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🎯 পরবর্তী ধাপ — CSS শেখার পথ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>HTML শেষ হলে এই ক্রমে শিখুন:</p>
+    <pre><code><span class="cm">১. CSS Basics
+   → রঙ, ফন্ট, মার্জিন, পেডিং, বর্ডার
+
+২. CSS Layout
+   → Flexbox, Grid, Position
+
+৩. Responsive Design
+   → Media Query, মোবাইল ফার্স্ট
+   → Bootstrap ফ্রেমওয়ার্ক
+
+৪. JavaScript
+   → বাটন ক্লিক, ফর্ম যাচাই
+   → DOM manipulation
+
+৫. প্রজেক্ট বানান
+   → পোর্টফোলিও সাইট
+   → ব্লগ পেজ
+   → ল্যান্ডিং পেজ</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+</div><!-- end timeline -->
+
+<div class="tip-box">
+  <h3>💡 HTML শেখার টিপস</h3>
+  <ul>
+    <li>প্রতিটি ট্যাগ শিখে সাথে সাথে ব্রাউজারে দেখুন</li>
+    <li>W3Schools.com — সহজ উদাহরণ ও অনলাইন এডিটর আছে</li>
+    <li>মোবাইলে Spck Editor বা Acode অ্যাপে প্র্যাকটিস করুন</li>
+    <li>একটি সম্পূর্ণ পোর্টফোলিও পেজ বানানোই মূল লক্ষ্য রাখুন</li>
+    <li>HTML শুধু কাঠামো — সুন্দর করতে CSS অবশ্যই লাগবে</li>
+  </ul>
+</div>
+
+<script>
+function togglePhase(el) {
+  if (event.target.classList.contains('topic-check')) return;
+  if (event.target.closest('.topic-row')) return;
+  el.classList.toggle('open');
+}
+function toggleTopic(row) {
+  event.stopPropagation();
+  if (event.target.classList.contains('topic-check')) return;
+  row.closest('.topic-item').classList.toggle('open');
+}
+function doCheck(el, e) {
+  e.stopPropagation();
+  el.classList.toggle('checked');
+  updateProgress();
+}
+function updateProgress() {
+  const all = document.querySelectorAll('.topic-check').length;
+  const done = document.querySelectorAll('.topic-check.checked').length;
+  const pct = all > 0 ? Math.round((done/all)*100) : 0;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = done + ' / ' + all + ' টপিক সম্পন্ন';
+}
+async function copyCode() {
+  const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(document.documentElement.outerHTML);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  } catch(e) {
+    const ta = document.createElement('textarea');
+    ta.value = document.documentElement.outerHTML;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    btn.textContent = '✅ কপি হয়েছে!'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  }
+}
+updateProgress();
+document.querySelector('.phase').classList.add('open');
+</script>
+
+
+</body></html>

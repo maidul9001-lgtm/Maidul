@@ -1,0 +1,1328 @@
+<html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSS শেখার রোডম্যাপ</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Hind Siliguri', sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px 60px; }
+  .header { text-align: center; margin-bottom: 40px; }
+  .header .badge { display: inline-block; background: linear-gradient(135deg,#3b82f6,#8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px; }
+  .header h1 { font-size: clamp(26px,6vw,44px); font-weight: 700; color: #f1f5f9; line-height: 1.2; }
+  .header h1 span { background: linear-gradient(135deg,#3b82f6,#8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header p { margin-top: 10px; color: #94a3b8; font-size: 15px; }
+  .copy-wrap { max-width: 720px; margin: 0 auto 20px; display: flex; justify-content: flex-end; }
+  #copyBtn { display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg,#3b82f6,#8b5cf6); color: #fff; border: none; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-family: 'Hind Siliguri', sans-serif; font-weight: 600; cursor: pointer; transition: opacity .2s, transform .1s; }
+  #copyBtn:active { transform: scale(.96); opacity: .85; }
+  #copyBtn.done { background: linear-gradient(135deg,#3ecf8e,#10b981); }
+  .progress-bar-wrap { max-width: 720px; margin: 0 auto 28px; }
+  .progress-info { display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 6px; }
+  .progress-track { height: 6px; background: #1e1e32; border-radius: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg,#3b82f6,#8b5cf6); border-radius: 10px; transition: width .4s ease; width: 0%; }
+  .timeline { max-width: 720px; margin: 0 auto; position: relative; }
+  .timeline::before { content:''; position: absolute; left: 28px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom,#3b82f644,#8b5cf644); }
+  .phase { margin-bottom: 8px; position: relative; }
+  .phase-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px 14px 68px; background: #1e1e32; border: 1px solid #2a2a45; border-radius: 12px; cursor: pointer; transition: background .2s, border-color .2s; position: relative; user-select: none; }
+  .phase-header:hover { background: #252540; border-color: #3a3a60; }
+  .phase-dot { position: absolute; left: -44px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 3px solid; background: #0f0f1a; z-index: 1; }
+  .phase-number { font-size: 11px; font-weight: 700; letter-spacing: 1px; min-width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-title { flex: 1; font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .phase-sub { font-size: 11px; color: #64748b; font-weight: 400; display: block; margin-top: 2px; }
+  .phase-time { font-size: 11px; color: #64748b; background: #1a1a2e; border: 1px solid #2a2a45; padding: 3px 8px; border-radius: 20px; white-space: nowrap; }
+  .chevron { font-size: 11px; color: #4a5568; transition: transform .3s; flex-shrink: 0; }
+  .phase.open .chevron { transform: rotate(180deg); }
+  .topics { display: none; padding: 0 0 8px 68px; }
+  .phase.open .topics { display: block; }
+  .topics-inner { background: #16162a; border: 1px solid #2a2a45; border-top: none; border-radius: 0 0 12px 12px; padding: 12px; }
+  .topic-item { margin-bottom: 6px; border-radius: 8px; overflow: hidden; }
+  .topic-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; cursor: pointer; transition: background .15s; }
+  .topic-row:hover { background: #1e1e32; }
+  .topic-check { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #3a3a60; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; transition: all .2s; }
+  .topic-check.checked { border-color: #3b82f6; background: #3b82f622; }
+  .topic-check.checked::after { content: '✓'; font-size: 11px; color: #3b82f6; font-weight: 700; }
+  .topic-text { font-size: 14px; color: #cbd5e1; line-height: 1.5; flex: 1; }
+  .topic-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .tag-imp { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f644; }
+  .tag-pro { background: #8b5cf622; color: #a78bfa; border: 1px solid #8b5cf644; }
+  .expand-icon { font-size: 10px; color: #4a5568; flex-shrink: 0; margin-top: 3px; transition: transform .2s; }
+  .topic-item.open .expand-icon { transform: rotate(90deg); }
+  .topic-detail { display: none; padding: 0 10px 12px 38px; }
+  .topic-item.open .topic-detail { display: block; }
+  .detail-box { background: #0f0f1a; border: 1px solid #2a2a45; border-radius: 8px; padding: 12px 14px; }
+  .detail-box p { font-size: 13px; color: #94a3b8; line-height: 1.7; margin-bottom: 8px; }
+  .detail-box p:last-child { margin-bottom: 0; }
+  pre { background: #1a1a2e; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin-top: 8px; }
+  code { font-family: 'Courier New', monospace; font-size: 12px; color: #7dd3fc; line-height: 1.6; white-space: pre; }
+  .cs { color: #f87171; }
+  .cp { color: #c084fc; }
+  .cv { color: #86efac; }
+  .cm { color: #475569; }
+  .ca { color: #fbbf24; }
+  .p1 .phase-dot{border-color:#f59e0b} .p1 .phase-number{background:#f59e0b22;color:#f59e0b}
+  .p2 .phase-dot{border-color:#3b82f6} .p2 .phase-number{background:#3b82f622;color:#3b82f6}
+  .p3 .phase-dot{border-color:#8b5cf6} .p3 .phase-number{background:#8b5cf622;color:#8b5cf6}
+  .p4 .phase-dot{border-color:#ec4899} .p4 .phase-number{background:#ec489922;color:#ec4899}
+  .p5 .phase-dot{border-color:#10b981} .p5 .phase-number{background:#10b98122;color:#10b981}
+  .p6 .phase-dot{border-color:#f97316} .p6 .phase-number{background:#f9731622;color:#f97316}
+  .p7 .phase-dot{border-color:#06b6d4} .p7 .phase-number{background:#06b6d422;color:#06b6d4}
+  .p8 .phase-dot{border-color:#ef4444} .p8 .phase-number{background:#ef444422;color:#ef4444}
+  .p9 .phase-dot{border-color:#a855f7} .p9 .phase-number{background:#a855f722;color:#a855f7}
+  .tip-box { max-width: 720px; margin: 28px auto 0; background: #16162a; border: 1px solid #2a2a45; border-left: 3px solid #3b82f6; border-radius: 10px; padding: 16px 20px; }
+  .tip-box h3 { font-size: 14px; color: #3b82f6; margin-bottom: 8px; }
+  .tip-box ul { list-style: none; }
+  .tip-box li { font-size: 13px; color: #94a3b8; padding: 4px 0; }
+  .tip-box li::before { content: '→ '; color: #3b82f6; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="header">
+  <div class="badge">🎨 Complete Roadmap</div>
+  <h1>CSS শেখার <span>A to Z গাইড</span></h1>
+  <p>প্রতিটি টপিকে ব্যাখ্যা ও কোড উদাহরণ সহ — ক্লিক করে বিস্তারিত দেখুন</p>
+</div>
+
+<div class="copy-wrap">
+  <button id="copyBtn" onclick="copyCode()">📋 HTML কোড কপি করুন</button>
+</div>
+
+<div class="progress-bar-wrap">
+  <div class="progress-info"><span>অগ্রগতি</span><span id="prog-text">0 / 29 টপিক সম্পন্ন</span></div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill" style="width: 0%;"></div></div>
+</div>
+
+<div class="timeline">
+
+<!-- PHASE 1 -->
+<div class="phase p1" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১</div>
+  <div class="phase-title">CSS পরিচিতি<span class="phase-sub">CSS কী ও কীভাবে কাজ করে</span></div>
+  <span class="phase-time">১-২ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">CSS কী এবং কেন দরকার?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>CSS (Cascading Style Sheets) দিয়ে HTML-কে সুন্দর করা হয়। HTML হলো কাঠামো, CSS হলো সেই কাঠামোর রঙ, আকার ও সৌন্দর্য।</p>
+    <p>CSS ছাড়া ওয়েবসাইট দেখতে সাদা-কালো নোটপ্যাডের মতো। CSS দিয়েই প্রফেশনাল ডিজাইন তৈরি হয়।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">CSS যুক্ত করার ৩ উপায় <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* ১. বাইরের ফাইল — সেরা পদ্ধতি */</span>
+<span class="cm">/* HTML-এ লিখুন: */</span>
+&lt;link rel=<span class="cv">"stylesheet"</span> href=<span class="cv">"style.css"</span>&gt;
+
+<span class="cm">/* ২. head-এর ভেতরে */</span>
+&lt;style&gt;
+  <span class="cs">body</span> { <span class="cp">background</span>: <span class="cv">#fff</span>; }
+&lt;/style&gt;
+
+<span class="cm">/* ৩. সরাসরি ট্যাগে — এড়িয়ে চলুন */</span>
+&lt;p style=<span class="cv">"color: red;"</span>&gt;লাল লেখা&lt;/p&gt;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">CSS সিনট্যাক্স ও কমেন্ট</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f87171">Selector</strong> → কোন এলিমেন্টে দেবো | <strong style="color:#fbbf24">Property</strong> → কী পরিবর্তন করবো | <strong style="color:#86efac">Value</strong> → কতটুকু বা কী রঙ</p>
+    <pre><code><span class="cm">/* এটি CSS কমেন্ট */</span>
+
+<span class="cs">p</span> {                    <span class="cm">/* selector */</span>
+  <span class="cp">color</span>: <span class="cv">red</span>;          <span class="cm">/* property: value */</span>
+  <span class="cp">font-size</span>: <span class="cv">16px</span>;
+  <span class="cp">font-weight</span>: <span class="cv">bold</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase p2" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">২</div>
+  <div class="phase-title">সিলেক্টর (Selectors)<span class="phase-sub">কোন এলিমেন্টে স্টাইল দেবো</span></div>
+  <span class="phase-time">৩-৪ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Element, Class ও ID সিলেক্টর <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* Element — সব p ট্যাগে */</span>
+<span class="cs">p</span> { <span class="cp">color</span>: <span class="cv">blue</span>; }
+
+<span class="cm">/* Class — class="card" যেখানে আছে */</span>
+<span class="cs">.card</span> { <span class="cp">background</span>: <span class="cv">#fff</span>; <span class="cp">padding</span>: <span class="cv">20px</span>; }
+
+<span class="cm">/* ID — id="header" যেখানে আছে */</span>
+<span class="cs">#header</span> { <span class="cp">background</span>: <span class="cv">#1a1a2e</span>; }
+
+<span class="cm">/* একসাথে একাধিক */</span>
+<span class="cs">h1, h2, h3</span> { <span class="cp">font-weight</span>: <span class="cv">bold</span>; }
+
+<span class="cm">/* সব এলিমেন্ট */</span>
+<span class="cs">*</span> { <span class="cp">box-sizing</span>: <span class="cv">border-box</span>; }</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Pseudo-class: hover, focus, nth-child</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* মাউস রাখলে */</span>
+<span class="cs">button:hover</span> { <span class="cp">background</span>: <span class="cv">#3b82f6</span>; }
+
+<span class="cm">/* ইনপুটে ক্লিক করলে */</span>
+<span class="cs">input:focus</span> { <span class="cp">border-color</span>: <span class="cv">blue</span>; }
+
+<span class="cm">/* প্রথম এলিমেন্ট */</span>
+<span class="cs">li:first-child</span> { <span class="cp">color</span>: <span class="cv">red</span>; }
+
+<span class="cm">/* শেষ এলিমেন্ট */</span>
+<span class="cs">li:last-child</span> { <span class="cp">color</span>: <span class="cv">green</span>; }
+
+<span class="cm">/* জোড় সংখ্যার এলিমেন্ট */</span>
+<span class="cs">tr:nth-child(even)</span> { <span class="cp">background</span>: <span class="cv">#f0f0f0</span>; }</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Pseudo-element: before, after</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* এলিমেন্টের আগে কিছু যোগ */</span>
+<span class="cs">h2::before</span> {
+  <span class="cp">content</span>: <span class="cv">"★ "</span>;
+  <span class="cp">color</span>: <span class="cv">gold</span>;
+}
+
+<span class="cm">/* এলিমেন্টের পরে কিছু যোগ */</span>
+<span class="cs">a::after</span> {
+  <span class="cp">content</span>: <span class="cv">" →"</span>;
+}
+
+<span class="cm">/* প্রথম অক্ষর বড় করা */</span>
+<span class="cs">p::first-letter</span> {
+  <span class="cp">font-size</span>: <span class="cv">2em</span>;
+  <span class="cp">float</span>: <span class="cv">left</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase p3" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৩</div>
+  <div class="phase-title">রঙ ও ব্যাকগ্রাউন্ড<span class="phase-sub">color, background, gradient</span></div>
+  <span class="phase-time">৩-৪ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">রঙ দেওয়ার উপায়সমূহ <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">p</span> {
+  <span class="cm">/* নাম দিয়ে */</span>
+  <span class="cp">color</span>: <span class="cv">red</span>;
+  <span class="cp">color</span>: <span class="cv">tomato</span>;
+
+  <span class="cm">/* HEX কোড (সবচেয়ে বেশি ব্যবহার) */</span>
+  <span class="cp">color</span>: <span class="cv">#3b82f6</span>;
+  <span class="cp">color</span>: <span class="cv">#fff</span>;
+
+  <span class="cm">/* RGB */</span>
+  <span class="cp">color</span>: <span class="cv">rgb(59, 130, 246)</span>;
+
+  <span class="cm">/* RGBA (শেষটি স্বচ্ছতা 0-1) */</span>
+  <span class="cp">color</span>: <span class="cv">rgba(0, 0, 0, 0.5)</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ব্যাকগ্রাউন্ড কাস্টমাইজ করা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">div</span> {
+  <span class="cm">/* রঙ */</span>
+  <span class="cp">background-color</span>: <span class="cv">#1e1e32</span>;
+
+  <span class="cm">/* ছবি */</span>
+  <span class="cp">background-image</span>: <span class="cv">url("bg.jpg")</span>;
+  <span class="cp">background-size</span>: <span class="cv">cover</span>;
+  <span class="cp">background-position</span>: <span class="cv">center</span>;
+  <span class="cp">background-repeat</span>: <span class="cv">no-repeat</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Gradient (রঙের মিশ্রণ) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.hero</span> {
+  <span class="cm">/* বাম থেকে ডানে */</span>
+  <span class="cp">background</span>: <span class="cv">linear-gradient(to right, #3b82f6, #8b5cf6)</span>;
+
+  <span class="cm">/* কোণাকোণি */</span>
+  <span class="cp">background</span>: <span class="cv">linear-gradient(135deg, #f97316, #ef4444)</span>;
+
+  <span class="cm">/* বৃত্তাকার */</span>
+  <span class="cp">background</span>: <span class="cv">radial-gradient(circle, #3b82f6, #1a1a2e)</span>;
+}
+
+<span class="cm">/* টেক্সটে গ্রেডিয়েন্ট */</span>
+<span class="cs">h1</span> {
+  <span class="cp">background</span>: <span class="cv">linear-gradient(135deg, #3b82f6, #8b5cf6)</span>;
+  <span class="cp">-webkit-background-clip</span>: <span class="cv">text</span>;
+  <span class="cp">-webkit-text-fill-color</span>: <span class="cv">transparent</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase p4" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৪</div>
+  <div class="phase-title">টেক্সট ও ফন্ট<span class="phase-sub">font, text-align, spacing</span></div>
+  <span class="phase-time">৩-৪ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ফন্ট স্টাইল করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">p</span> {
+  <span class="cp">font-size</span>: <span class="cv">16px</span>;        <span class="cm">/* সাইজ */</span>
+  <span class="cp">font-weight</span>: <span class="cv">bold</span>;      <span class="cm">/* মোটা (100-900) */</span>
+  <span class="cp">font-style</span>: <span class="cv">italic</span>;    <span class="cm">/* তির্যক */</span>
+  <span class="cp">font-family</span>: <span class="cv">'Arial', sans-serif</span>;
+  <span class="cp">line-height</span>: <span class="cv">1.6</span>;      <span class="cm">/* লাইনের উচ্চতা */</span>
+  <span class="cp">letter-spacing</span>: <span class="cv">1px</span>;  <span class="cm">/* অক্ষরের ফাঁক */</span>
+}
+
+<span class="cm">/* Google Fonts ব্যবহার */</span>
+<span class="cs">@import</span> <span class="cv">url('https://fonts.googleapis.com/css2?family=Roboto&amp;display=swap')</span>;
+<span class="cs">body</span> { <span class="cp">font-family</span>: <span class="cv">'Roboto', sans-serif</span>; }</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">টেক্সট অ্যালাইনমেন্ট ও ডেকোরেশন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">h1</span> {
+  <span class="cp">text-align</span>: <span class="cv">center</span>;     <span class="cm">/* মাঝে, left, right */</span>
+  <span class="cp">text-transform</span>: <span class="cv">uppercase</span>; <span class="cm">/* বড় হাতে */</span>
+  <span class="cp">text-decoration</span>: <span class="cv">underline</span>; <span class="cm">/* আন্ডারলাইন */</span>
+  <span class="cp">text-shadow</span>: <span class="cv">2px 2px 4px rgba(0,0,0,0.5)</span>;
+}
+
+<span class="cm">/* লিংকের আন্ডারলাইন সরানো */</span>
+<span class="cs">a</span> {
+  <span class="cp">text-decoration</span>: <span class="cv">none</span>;
+  <span class="cp">color</span>: <span class="cv">inherit</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 5 -->
+<div class="phase p5" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৫</div>
+  <div class="phase-title">বক্স মডেল (Box Model)<span class="phase-sub">margin, padding, border, width</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Box Model কী? <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>প্রতিটি HTML এলিমেন্ট একটি বাক্সের মতো। বাইরে থেকে ভেতরে: <strong style="color:#fbbf24">margin → border → padding → content</strong></p>
+    <pre><code><span class="cs">.box</span> {
+  <span class="cm">/* Content এর সাইজ */</span>
+  <span class="cp">width</span>: <span class="cv">300px</span>;
+  <span class="cp">height</span>: <span class="cv">200px</span>;
+
+  <span class="cm">/* ভেতরের ফাঁকা জায়গা */</span>
+  <span class="cp">padding</span>: <span class="cv">20px</span>;
+
+  <span class="cm">/* বাইরের ফাঁকা জায়গা */</span>
+  <span class="cp">margin</span>: <span class="cv">10px</span>;
+
+  <span class="cm">/* বর্ডার */</span>
+  <span class="cp">border</span>: <span class="cv">2px solid #3b82f6</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Padding ও Margin বিস্তারিত</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.box</span> {
+  <span class="cm">/* চারদিকে সমান */</span>
+  <span class="cp">padding</span>: <span class="cv">20px</span>;
+
+  <span class="cm">/* উপর-নিচ, বাম-ডান */</span>
+  <span class="cp">padding</span>: <span class="cv">10px 20px</span>;
+
+  <span class="cm">/* উপর, ডান, নিচ, বাম */</span>
+  <span class="cp">padding</span>: <span class="cv">5px 10px 15px 20px</span>;
+
+  <span class="cm">/* আলাদাভাবে */</span>
+  <span class="cp">padding-top</span>: <span class="cv">10px</span>;
+  <span class="cp">padding-right</span>: <span class="cv">20px</span>;
+  <span class="cp">padding-bottom</span>: <span class="cv">10px</span>;
+  <span class="cp">padding-left</span>: <span class="cv">20px</span>;
+
+  <span class="cm">/* মাঝে রাখতে */</span>
+  <span class="cp">margin</span>: <span class="cv">0 auto</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Border ও Border-radius</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.card</span> {
+  <span class="cm">/* বর্ডার: মোটা, ধরন, রঙ */</span>
+  <span class="cp">border</span>: <span class="cv">2px solid #3b82f6</span>;
+  <span class="cp">border</span>: <span class="cv">1px dashed #ccc</span>;   <span class="cm">/* ড্যাশ */</span>
+  <span class="cp">border</span>: <span class="cv">3px dotted red</span>;    <span class="cm">/* ডট */</span>
+
+  <span class="cm">/* কোণ গোল করা */</span>
+  <span class="cp">border-radius</span>: <span class="cv">8px</span>;        <span class="cm">/* চারকোণ */</span>
+  <span class="cp">border-radius</span>: <span class="cv">50%</span>;        <span class="cm">/* পুরো গোল */</span>
+  <span class="cp">border-radius</span>: <span class="cv">10px 0 10px 0</span>; <span class="cm">/* আলাদা */</span>
+
+  <span class="cm">/* ছায়া */</span>
+  <span class="cp">box-shadow</span>: <span class="cv">0 4px 20px rgba(0,0,0,0.3)</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">width, height, max-width</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.container</span> {
+  <span class="cp">width</span>: <span class="cv">100%</span>;       <span class="cm">/* পুরো প্রস্থ */</span>
+  <span class="cp">max-width</span>: <span class="cv">1200px</span>; <span class="cm">/* সর্বোচ্চ প্রস্থ */</span>
+  <span class="cp">margin</span>: <span class="cv">0 auto</span>;   <span class="cm">/* মাঝে রাখা */</span>
+
+  <span class="cm">/* উচ্চতা */</span>
+  <span class="cp">height</span>: <span class="cv">100px</span>;
+  <span class="cp">min-height</span>: <span class="cv">100vh</span>; <span class="cm">/* স্ক্রিনের পুরো উচ্চতা */</span>
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 6 -->
+<div class="phase p6" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৬</div>
+  <div class="phase-title">Flexbox লেআউট<span class="phase-sub">আধুনিক লেআউটের সেরা পদ্ধতি</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Flexbox শুরু করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Flexbox দিয়ে এলিমেন্ট পাশাপাশি বা উপর-নিচে সহজে সাজানো যায়।</p>
+    <pre><code><span class="cs">.container</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+
+  <span class="cm">/* দিকনির্দেশনা */</span>
+  <span class="cp">flex-direction</span>: <span class="cv">row</span>;     <span class="cm">/* পাশাপাশি (default) */</span>
+  <span class="cp">flex-direction</span>: <span class="cv">column</span>;  <span class="cm">/* উপর-নিচ */</span>
+
+  <span class="cm">/* মোড়ানো */</span>
+  <span class="cp">flex-wrap</span>: <span class="cv">wrap</span>;  <span class="cm">/* জায়গা না হলে নিচে যাবে */</span>
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">justify-content ও align-items <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.container</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+
+  <span class="cm">/* অনুভূমিক সাজানো */</span>
+  <span class="cp">justify-content</span>: <span class="cv">flex-start</span>;   <span class="cm">/* বাম */</span>
+  <span class="cp">justify-content</span>: <span class="cv">flex-end</span>;     <span class="cm">/* ডান */</span>
+  <span class="cp">justify-content</span>: <span class="cv">center</span>;       <span class="cm">/* মাঝে */</span>
+  <span class="cp">justify-content</span>: <span class="cv">space-between</span>; <span class="cm">/* দুই মাথায় */</span>
+  <span class="cp">justify-content</span>: <span class="cv">space-around</span>;  <span class="cm">/* চারদিকে ফাঁক */</span>
+
+  <span class="cm">/* উল্লম্ব সাজানো */</span>
+  <span class="cp">align-items</span>: <span class="cv">center</span>;    <span class="cm">/* মাঝে */</span>
+  <span class="cp">align-items</span>: <span class="cv">flex-start</span>; <span class="cm">/* উপরে */</span>
+  <span class="cp">align-items</span>: <span class="cv">stretch</span>;    <span class="cm">/* টেনে লম্বা */</span>
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Flexbox দিয়ে পূর্ণ সেন্টার করা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>পেজের মাঝে কিছু রাখতে সবচেয়ে সহজ উপায়:</p>
+    <pre><code><span class="cs">.center-box</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+  <span class="cp">justify-content</span>: <span class="cv">center</span>;
+  <span class="cp">align-items</span>: <span class="cv">center</span>;
+  <span class="cp">min-height</span>: <span class="cv">100vh</span>;
+}
+
+<span class="cm">/* নেভবার উদাহরণ */</span>
+<span class="cs">nav</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+  <span class="cp">justify-content</span>: <span class="cv">space-between</span>;
+  <span class="cp">align-items</span>: <span class="cv">center</span>;
+  <span class="cp">padding</span>: <span class="cv">16px 24px</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">flex: 1 ও gap</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.container</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+  <span class="cp">gap</span>: <span class="cv">20px</span>;  <span class="cm">/* আইটেমের মাঝে ফাঁক */</span>
+}
+
+<span class="cm">/* সমান জায়গা নেওয়া */</span>
+<span class="cs">.item</span> { <span class="cp">flex</span>: <span class="cv">1</span>; }
+
+<span class="cm">/* ৩ কলামের কার্ড লেআউট */</span>
+<span class="cs">.cards</span> {
+  <span class="cp">display</span>: <span class="cv">flex</span>;
+  <span class="cp">flex-wrap</span>: <span class="cv">wrap</span>;
+  <span class="cp">gap</span>: <span class="cv">16px</span>;
+}
+<span class="cs">.card</span> {
+  <span class="cp">flex</span>: <span class="cv">1 1 300px</span>; <span class="cm">/* min 300px, নয়তো বাড়বে */</span>
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 7 -->
+<div class="phase p7" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৭</div>
+  <div class="phase-title">CSS Grid লেআউট<span class="phase-sub">দুই দিকে সাজানোর শক্তিশালী উপায়</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Grid শুরু করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Grid দিয়ে সারি ও কলামে এলিমেন্ট সাজানো যায় — পত্রিকার লেআউটের মতো।</p>
+    <pre><code><span class="cs">.grid</span> {
+  <span class="cp">display</span>: <span class="cv">grid</span>;
+
+  <span class="cm">/* ৩টি সমান কলাম */</span>
+  <span class="cp">grid-template-columns</span>: <span class="cv">1fr 1fr 1fr</span>;
+
+  <span class="cm">/* shorthand */</span>
+  <span class="cp">grid-template-columns</span>: <span class="cv">repeat(3, 1fr)</span>;
+
+  <span class="cm">/* গ্যাপ */</span>
+  <span class="cp">gap</span>: <span class="cv">20px</span>;
+}
+
+<span class="cm">/* রেসপন্সিভ কার্ড গ্রিড */</span>
+<span class="cs">.cards</span> {
+  <span class="cp">display</span>: <span class="cv">grid</span>;
+  <span class="cp">grid-template-columns</span>: <span class="cv">repeat(auto-fit, minmax(250px, 1fr))</span>;
+  <span class="cp">gap</span>: <span class="cv">16px</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">grid-column ও grid-row দিয়ে ঘর জুড়া</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.grid</span> {
+  <span class="cp">display</span>: <span class="cv">grid</span>;
+  <span class="cp">grid-template-columns</span>: <span class="cv">repeat(3, 1fr)</span>;
+  <span class="cp">gap</span>: <span class="cv">16px</span>;
+}
+
+<span class="cm">/* ২টি কলাম জুড়ে দেওয়া */</span>
+<span class="cs">.big-item</span> {
+  <span class="cp">grid-column</span>: <span class="cv">span 2</span>;
+}
+
+<span class="cm">/* ২টি সারি জুড়ে দেওয়া */</span>
+<span class="cs">.tall-item</span> {
+  <span class="cp">grid-row</span>: <span class="cv">span 2</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 8 -->
+<div class="phase p8" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৮</div>
+  <div class="phase-title">Responsive Design<span class="phase-sub">মোবাইল ও ডেস্কটপে সুন্দর দেখানো</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Media Query <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>স্ক্রিনের সাইজ অনুযায়ী আলাদা স্টাইল দেওয়া যায়।</p>
+    <pre><code><span class="cm">/* মোবাইল ফার্স্ট (ছোট থেকে বড়) */</span>
+
+<span class="cm">/* সব স্ক্রিনে */</span>
+<span class="cs">.container</span> { <span class="cp">padding</span>: <span class="cv">16px</span>; }
+
+<span class="cm">/* ট্যাবলেট (768px বা বড়) */</span>
+<span class="cs">@media</span> (<span class="cp">min-width</span>: <span class="cv">768px</span>) {
+  <span class="cs">.container</span> { <span class="cp">padding</span>: <span class="cv">24px</span>; }
+  <span class="cs">.grid</span> { <span class="cp">grid-template-columns</span>: <span class="cv">repeat(2, 1fr)</span>; }
+}
+
+<span class="cm">/* ডেস্কটপ (1024px বা বড়) */</span>
+<span class="cs">@media</span> (<span class="cp">min-width</span>: <span class="cv">1024px</span>) {
+  <span class="cs">.container</span> { <span class="cp">max-width</span>: <span class="cv">1200px</span>; <span class="cp">margin</span>: <span class="cv">0 auto</span>; }
+  <span class="cs">.grid</span> { <span class="cp">grid-template-columns</span>: <span class="cv">repeat(3, 1fr)</span>; }
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Responsive Units: %, vw, vh, rem, em</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.box</span> {
+  <span class="cp">width</span>: <span class="cv">50%</span>;    <span class="cm">/* parent-এর ৫০% */</span>
+  <span class="cp">width</span>: <span class="cv">100vw</span>;  <span class="cm">/* স্ক্রিনের পুরো প্রস্থ */</span>
+  <span class="cp">height</span>: <span class="cv">100vh</span>; <span class="cm">/* স্ক্রিনের পুরো উচ্চতা */</span>
+
+  <span class="cm">/* rem = root font-size (সাধারণত 16px) */</span>
+  <span class="cp">font-size</span>: <span class="cv">1rem</span>;   <span class="cm">/* = 16px */</span>
+  <span class="cp">font-size</span>: <span class="cv">1.5rem</span>; <span class="cm">/* = 24px */</span>
+
+  <span class="cm">/* em = parent font-size */</span>
+  <span class="cp">padding</span>: <span class="cv">1em</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Responsive Image ও Video</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* ছবি কখনো overflow করবে না */</span>
+<span class="cs">img</span> {
+  <span class="cp">max-width</span>: <span class="cv">100%</span>;
+  <span class="cp">height</span>: <span class="cv">auto</span>;
+}
+
+<span class="cm">/* ভিডিও responsive */</span>
+<span class="cs">.video-wrap</span> {
+  <span class="cp">position</span>: <span class="cv">relative</span>;
+  <span class="cp">padding-bottom</span>: <span class="cv">56.25%</span>; <span class="cm">/* 16:9 ratio */</span>
+}
+<span class="cs">.video-wrap iframe</span> {
+  <span class="cp">position</span>: <span class="cv">absolute</span>;
+  <span class="cp">width</span>: <span class="cv">100%</span>;
+  <span class="cp">height</span>: <span class="cv">100%</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 9 -->
+<div class="phase p9" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৯</div>
+  <div class="phase-title">অ্যানিমেশন ও অ্যাডভান্সড<span class="phase-sub">transition, animation, variables</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Transition (মসৃণ পরিবর্তন) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">button</span> {
+  <span class="cp">background</span>: <span class="cv">#3b82f6</span>;
+  <span class="cp">color</span>: <span class="cv">white</span>;
+  <span class="cp">padding</span>: <span class="cv">10px 20px</span>;
+  <span class="cp">border</span>: <span class="cv">none</span>;
+  <span class="cp">border-radius</span>: <span class="cv">8px</span>;
+
+  <span class="cm">/* মসৃণ পরিবর্তন: property, সময়, ধরন */</span>
+  <span class="cp">transition</span>: <span class="cv">all 0.3s ease</span>;
+}
+
+<span class="cs">button:hover</span> {
+  <span class="cp">background</span>: <span class="cv">#1d4ed8</span>;
+  <span class="cp">transform</span>: <span class="cv">scale(1.05)</span>;  <span class="cm">/* একটু বড় */</span>
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Transform: scale, rotate, translate</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cs">.box</span> {
+  <span class="cp">transform</span>: <span class="cv">scale(1.2)</span>;       <span class="cm">/* ২০% বড় */</span>
+  <span class="cp">transform</span>: <span class="cv">rotate(45deg)</span>;    <span class="cm">/* ৪৫° ঘোরানো */</span>
+  <span class="cp">transform</span>: <span class="cv">translateX(50px)</span>; <span class="cm">/* ডানে সরানো */</span>
+  <span class="cp">transform</span>: <span class="cv">translateY(-20px)</span>;<span class="cm">/* উপরে সরানো */</span>
+
+  <span class="cm">/* একসাথে */</span>
+  <span class="cp">transform</span>: <span class="cv">scale(1.1) rotate(5deg)</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Keyframe Animation <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">/* অ্যানিমেশন তৈরি */</span>
+<span class="cs">@keyframes</span> <span class="ca">bounce</span> {
+  <span class="cv">0%</span>   { <span class="cp">transform</span>: <span class="cv">translateY(0)</span>; }
+  <span class="cv">50%</span>  { <span class="cp">transform</span>: <span class="cv">translateY(-20px)</span>; }
+  <span class="cv">100%</span> { <span class="cp">transform</span>: <span class="cv">translateY(0)</span>; }
+}
+
+<span class="cm">/* এলিমেন্টে লাগানো */</span>
+<span class="cs">.ball</span> {
+  <span class="cp">animation</span>: <span class="cv">bounce 1s ease infinite</span>;
+}
+
+<span class="cm">/* ফেড ইন */</span>
+<span class="cs">@keyframes</span> <span class="ca">fadeIn</span> {
+  <span class="cv">from</span> { <span class="cp">opacity</span>: <span class="cv">0</span>; }
+  <span class="cv">to</span>   { <span class="cp">opacity</span>: <span class="cv">1</span>; }
+}
+<span class="cs">.hero</span> { <span class="cp">animation</span>: <span class="cv">fadeIn 1s ease</span>; }</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">CSS Variables (Custom Properties) <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>পুরো সাইটে একটি রঙ পরিবর্তন করতে চাইলে CSS Variable দিয়ে এক জায়গায় পরিবর্তন করলেই হয়।</p>
+    <pre><code><span class="cm">/* :root এ ভেরিয়েবল সংজ্ঞায়িত করুন */</span>
+<span class="cs">:root</span> {
+  <span class="cp">--primary</span>: <span class="cv">#3b82f6</span>;
+  <span class="cp">--secondary</span>: <span class="cv">#8b5cf6</span>;
+  <span class="cp">--bg</span>: <span class="cv">#0f0f1a</span>;
+  <span class="cp">--text</span>: <span class="cv">#f1f5f9</span>;
+  <span class="cp">--radius</span>: <span class="cv">8px</span>;
+}
+
+<span class="cm">/* ব্যবহার */</span>
+<span class="cs">button</span> {
+  <span class="cp">background</span>: <span class="cv">var(--primary)</span>;
+  <span class="cp">border-radius</span>: <span class="cv">var(--radius)</span>;
+  <span class="cp">color</span>: <span class="cv">var(--text)</span>;
+}</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🎯 পরবর্তী ধাপ — JavaScript এর পথে</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>CSS শেষ হলে এই ক্রমে এগিয়ে যান:</p>
+    <pre><code><span class="cm">১. Bootstrap / Tailwind CSS
+   → রেডিমেড CSS ফ্রেমওয়ার্ক
+   → দ্রুত সুন্দর UI বানানো যায়
+
+২. JavaScript Basics
+   → বাটন ক্লিক, ফর্ম যাচাই
+   → DOM manipulation
+
+৩. প্রজেক্ট বানান
+   → পোর্টফোলিও ওয়েবসাইট
+   → ল্যান্ডিং পেজ
+   → ব্লগ ডিজাইন
+
+৪. এরপর React / Next.js
+   → আধুনিক ওয়েব ডেভেলপমেন্ট</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+</div><!-- end timeline -->
+
+<div class="tip-box">
+  <h3>💡 CSS শেখার টিপস</h3>
+  <ul>
+    <li>Browser DevTools (F12) খুলে live CSS পরিবর্তন করে দেখুন</li>
+    <li>Flexbox Froggy ও Grid Garden গেম খেলে শিখুন (বিনামূল্যে)</li>
+    <li>প্রতিটি ধাপ শিখে একটি কার্ড বা সেকশন বানান</li>
+    <li>Coolors.co দিয়ে সুন্দর রঙের প্যালেট তৈরি করুন</li>
+    <li>Bootstrap শেখার আগে অবশ্যই CSS Basics শেষ করুন</li>
+  </ul>
+</div>
+
+<script>
+function togglePhase(el) {
+  if (event.target.classList.contains('topic-check')) return;
+  if (event.target.closest('.topic-row')) return;
+  el.classList.toggle('open');
+}
+function toggleTopic(row) {
+  event.stopPropagation();
+  if (event.target.classList.contains('topic-check')) return;
+  row.closest('.topic-item').classList.toggle('open');
+}
+function doCheck(el, e) {
+  e.stopPropagation();
+  el.classList.toggle('checked');
+  updateProgress();
+}
+function updateProgress() {
+  const all = document.querySelectorAll('.topic-check').length;
+  const done = document.querySelectorAll('.topic-check.checked').length;
+  const pct = all > 0 ? Math.round((done/all)*100) : 0;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = done + ' / ' + all + ' টপিক সম্পন্ন';
+}
+async function copyCode() {
+  const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(document.documentElement.outerHTML);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  } catch(e) {
+    const ta = document.createElement('textarea');
+    ta.value = document.documentElement.outerHTML;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    btn.textContent = '✅ কপি হয়েছে!'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  }
+}
+updateProgress();
+document.querySelector('.phase').classList.add('open');
+</script>
+
+
+</body></html>

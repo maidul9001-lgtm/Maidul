@@ -1,0 +1,1220 @@
+<html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SQL শেখার রোডম্যাপ</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Hind Siliguri', sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px 60px; }
+  .header { text-align: center; margin-bottom: 40px; }
+  .header .badge { display: inline-block; background: linear-gradient(135deg,#10b981,#06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px; }
+  .header h1 { font-size: clamp(26px,6vw,44px); font-weight: 700; color: #f1f5f9; line-height: 1.2; }
+  .header h1 span { background: linear-gradient(135deg,#10b981,#06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header p { margin-top: 10px; color: #94a3b8; font-size: 15px; }
+  .copy-wrap { max-width: 720px; margin: 0 auto 20px; display: flex; justify-content: flex-end; }
+  #copyBtn { display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg,#10b981,#06b6d4); color: #fff; border: none; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-family: 'Hind Siliguri', sans-serif; font-weight: 600; cursor: pointer; transition: opacity .2s, transform .1s; }
+  #copyBtn:active { transform: scale(.96); opacity: .85; }
+  #copyBtn.done { background: linear-gradient(135deg,#3ecf8e,#10b981); }
+  .progress-bar-wrap { max-width: 720px; margin: 0 auto 28px; }
+  .progress-info { display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 6px; }
+  .progress-track { height: 6px; background: #1e1e32; border-radius: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg,#10b981,#06b6d4); border-radius: 10px; transition: width .4s ease; width: 0%; }
+  .timeline { max-width: 720px; margin: 0 auto; position: relative; }
+  .timeline::before { content:''; position: absolute; left: 28px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom,#10b98144,#06b6d444); }
+  .phase { margin-bottom: 8px; position: relative; }
+  .phase-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px 14px 68px; background: #1e1e32; border: 1px solid #2a2a45; border-radius: 12px; cursor: pointer; transition: background .2s, border-color .2s; position: relative; user-select: none; }
+  .phase-header:hover { background: #252540; border-color: #3a3a60; }
+  .phase-dot { position: absolute; left: -44px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 3px solid; background: #0f0f1a; z-index: 1; }
+  .phase-number { font-size: 11px; font-weight: 700; letter-spacing: 1px; min-width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-title { flex: 1; font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .phase-sub { font-size: 11px; color: #64748b; font-weight: 400; display: block; margin-top: 2px; }
+  .phase-time { font-size: 11px; color: #64748b; background: #1a1a2e; border: 1px solid #2a2a45; padding: 3px 8px; border-radius: 20px; white-space: nowrap; }
+  .chevron { font-size: 11px; color: #4a5568; transition: transform .3s; flex-shrink: 0; }
+  .phase.open .chevron { transform: rotate(180deg); }
+  .topics { display: none; padding: 0 0 8px 68px; }
+  .phase.open .topics { display: block; }
+  .topics-inner { background: #16162a; border: 1px solid #2a2a45; border-top: none; border-radius: 0 0 12px 12px; padding: 12px; }
+  .topic-item { margin-bottom: 6px; border-radius: 8px; overflow: hidden; }
+  .topic-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; cursor: pointer; transition: background .15s; }
+  .topic-row:hover { background: #1e1e32; }
+  .topic-check { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #3a3a60; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; transition: all .2s; }
+  .topic-check.checked { border-color: #10b981; background: #10b98122; }
+  .topic-check.checked::after { content: '✓'; font-size: 11px; color: #10b981; font-weight: 700; }
+  .topic-text { font-size: 14px; color: #cbd5e1; line-height: 1.5; flex: 1; }
+  .topic-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .tag-imp { background: #10b98122; color: #34d399; border: 1px solid #10b98144; }
+  .tag-pro { background: #06b6d422; color: #22d3ee; border: 1px solid #06b6d444; }
+  .expand-icon { font-size: 10px; color: #4a5568; flex-shrink: 0; margin-top: 3px; transition: transform .2s; }
+  .topic-item.open .expand-icon { transform: rotate(90deg); }
+  .topic-detail { display: none; padding: 0 10px 12px 38px; }
+  .topic-item.open .topic-detail { display: block; }
+  .detail-box { background: #0f0f1a; border: 1px solid #2a2a45; border-radius: 8px; padding: 12px 14px; }
+  .detail-box p { font-size: 13px; color: #94a3b8; line-height: 1.7; margin-bottom: 8px; }
+  .detail-box p:last-child { margin-bottom: 0; }
+  pre { background: #1a1a2e; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin-top: 8px; }
+  code { font-family: 'Courier New', monospace; font-size: 12px; color: #7dd3fc; line-height: 1.6; white-space: pre; }
+  .ck { color: #c084fc; }
+  .cs { color: #86efac; }
+  .cn { color: #fbbf24; }
+  .cm { color: #475569; }
+  .cf { color: #f87171; }
+  .p1 .phase-dot{border-color:#f59e0b} .p1 .phase-number{background:#f59e0b22;color:#f59e0b}
+  .p2 .phase-dot{border-color:#10b981} .p2 .phase-number{background:#10b98122;color:#10b981}
+  .p3 .phase-dot{border-color:#3b82f6} .p3 .phase-number{background:#3b82f622;color:#3b82f6}
+  .p4 .phase-dot{border-color:#8b5cf6} .p4 .phase-number{background:#8b5cf622;color:#8b5cf6}
+  .p5 .phase-dot{border-color:#ec4899} .p5 .phase-number{background:#ec489922;color:#ec4899}
+  .p6 .phase-dot{border-color:#f97316} .p6 .phase-number{background:#f9731622;color:#f97316}
+  .p7 .phase-dot{border-color:#06b6d4} .p7 .phase-number{background:#06b6d422;color:#06b6d4}
+  .p8 .phase-dot{border-color:#ef4444} .p8 .phase-number{background:#ef444422;color:#ef4444}
+  .tip-box { max-width: 720px; margin: 28px auto 0; background: #16162a; border: 1px solid #2a2a45; border-left: 3px solid #10b981; border-radius: 10px; padding: 16px 20px; }
+  .tip-box h3 { font-size: 14px; color: #10b981; margin-bottom: 8px; }
+  .tip-box ul { list-style: none; }
+  .tip-box li { font-size: 13px; color: #94a3b8; padding: 4px 0; }
+  .tip-box li::before { content: '→ '; color: #10b981; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="header">
+  <div class="badge">🗄️ Complete Roadmap</div>
+  <h1>SQL শেখার <span>A to Z গাইড</span></h1>
+  <p>প্রতিটি টপিকে ব্যাখ্যা ও কোড উদাহরণ সহ — ক্লিক করে বিস্তারিত দেখুন</p>
+</div>
+
+<div class="copy-wrap">
+  <button id="copyBtn" onclick="copyCode()" class="">📋 HTML কোড কপি করুন</button>
+</div>
+
+<div class="progress-bar-wrap">
+  <div class="progress-info"><span>অগ্রগতি</span><span id="prog-text">0 / 26 টপিক সম্পন্ন</span></div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill" style="width: 0%;"></div></div>
+</div>
+
+<div class="timeline">
+
+<!-- PHASE 1 -->
+<div class="phase p1" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১</div>
+  <div class="phase-title">SQL পরিচিতি ও Setup<span class="phase-sub">Database কী, MySQL/SQLite ইনস্টল</span></div>
+  <span class="phase-time">১-২ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Database ও SQL কী?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">Database</strong> হলো তথ্য সংরক্ষণের গুদামঘর। <strong style="color:#f1f5f9">SQL</strong> (Structured Query Language) দিয়ে সেই তথ্য যোগ, দেখা, পরিবর্তন ও মুছা যায়।</p>
+    <p>যেমন — একটি স্কুলের ডেটাবেসে ছাত্রছাত্রীর নাম, রোল, মার্কস সব টেবিলে সাজানো থাকে। SQL দিয়ে প্রশ্ন করে নির্দিষ্ট তথ্য বের করা যায়।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">MySQL / SQLite ইনস্টল করা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">MySQL</strong> — সবচেয়ে জনপ্রিয়। <strong style="color:#f1f5f9">SQLite</strong> — হালকা, ফাইলভিত্তিক (মোবাইলেও চলে)।</p>
+    <p>শুরু করতে <strong style="color:#34d399">DB Browser for SQLite</strong> (বিনামূল্যে) ডাউনলোড করুন — সহজ GUI আছে। অথবা অনলাইনে <strong style="color:#34d399">sqliteonline.com</strong> ব্যবহার করুন।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Table, Row, Column কী?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ডেটাবেস Excel-এর মতো। <strong style="color:#fbbf24">Table</strong> = শিট, <strong style="color:#fbbf24">Column</strong> = কলাম (নাম, বয়স), <strong style="color:#fbbf24">Row</strong> = একটি রেকর্ড।</p>
+    <pre><code><span class="cm">-- students টেবিলের উদাহরণ:</span>
+<span class="cm">-- id | naam    | boyosh | marks</span>
+<span class="cm">-- ---|---------|--------|------</span>
+<span class="cm">--  1 | Maidul  |  25    |  85</span>
+<span class="cm">--  2 | Rahim   |  22    |  90</span>
+<span class="cm">--  3 | Karim   |  24    |  78</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase p2" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">২</div>
+  <div class="phase-title">Database ও Table তৈরি<span class="phase-sub">CREATE, Data Types</span></div>
+  <span class="phase-time">২-৩ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Database তৈরি ও ব্যবহার</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- নতুন ডেটাবেস তৈরি</span>
+<span class="ck">CREATE DATABASE</span> school_db;
+
+<span class="cm">-- ডেটাবেস ব্যবহার শুরু</span>
+<span class="ck">USE</span> school_db;
+
+<span class="cm">-- সব ডেটাবেস দেখা</span>
+<span class="ck">SHOW DATABASES</span>;
+
+<span class="cm">-- ডেটাবেস মুছা</span>
+<span class="ck">DROP DATABASE</span> school_db;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Data Types — তথ্যের ধরন <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- সংখ্যা</span>
+<span class="cf">INT</span>          <span class="cm">-- পূর্ণ সংখ্যা: 1, 25, 1000</span>
+<span class="cf">FLOAT</span>        <span class="cm">-- দশমিক: 3.14, 9.99</span>
+<span class="cf">DECIMAL(8,2)</span> <span class="cm">-- নির্দিষ্ট দশমিক: 12345.67</span>
+
+<span class="cm">-- টেক্সট</span>
+<span class="cf">VARCHAR(100)</span> <span class="cm">-- সর্বোচ্চ ১০০ অক্ষর</span>
+<span class="cf">TEXT</span>         <span class="cm">-- বড় লেখা</span>
+<span class="cf">CHAR(10)</span>     <span class="cm">-- নির্দিষ্ট ১০ অক্ষর</span>
+
+<span class="cm">-- তারিখ</span>
+<span class="cf">DATE</span>         <span class="cm">-- 2024-01-15</span>
+<span class="cf">DATETIME</span>     <span class="cm">-- 2024-01-15 10:30:00</span>
+
+<span class="cm">-- সত্য/মিথ্যা</span>
+<span class="cf">BOOLEAN</span>      <span class="cm">-- TRUE বা FALSE</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Table তৈরি: CREATE TABLE <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">CREATE TABLE</span> students (
+    id      <span class="cf">INT</span> <span class="ck">PRIMARY KEY AUTO_INCREMENT</span>,
+    naam    <span class="cf">VARCHAR(100)</span> <span class="ck">NOT NULL</span>,
+    boyosh  <span class="cf">INT</span>,
+    email   <span class="cf">VARCHAR(200)</span> <span class="ck">UNIQUE</span>,
+    marks   <span class="cf">DECIMAL(5,2)</span>,
+    join_date <span class="cf">DATE</span> <span class="ck">DEFAULT</span> <span class="cs">CURRENT_DATE</span>
+);
+
+<span class="cm">-- টেবিলের গঠন দেখা</span>
+<span class="ck">DESCRIBE</span> students;
+
+<span class="cm">-- টেবিল মুছা</span>
+<span class="ck">DROP TABLE</span> students;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase p3" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৩</div>
+  <div class="phase-title">তথ্য যোগ ও দেখা<span class="phase-sub">INSERT, SELECT</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">INSERT — তথ্য যোগ করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- একটি রেকর্ড যোগ</span>
+<span class="ck">INSERT INTO</span> students (naam, boyosh, email, marks)
+<span class="ck">VALUES</span> (<span class="cs">'Maidul'</span>, <span class="cn">25</span>, <span class="cs">'maidul@gmail.com'</span>, <span class="cn">85.50</span>);
+
+<span class="cm">-- একসাথে অনেক রেকর্ড</span>
+<span class="ck">INSERT INTO</span> students (naam, boyosh, marks)
+<span class="ck">VALUES</span>
+    (<span class="cs">'Rahim'</span>,  <span class="cn">22</span>, <span class="cn">90.00</span>),
+    (<span class="cs">'Karim'</span>,  <span class="cn">24</span>, <span class="cn">78.50</span>),
+    (<span class="cs">'Sumaiya'</span>, <span class="cn">21</span>, <span class="cn">95.00</span>);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">SELECT — তথ্য দেখা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- সব তথ্য দেখা</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students;
+
+<span class="cm">-- নির্দিষ্ট কলাম</span>
+<span class="ck">SELECT</span> naam, marks <span class="ck">FROM</span> students;
+
+<span class="cm">-- কলামের নাম বদলে দেখানো</span>
+<span class="ck">SELECT</span> naam <span class="ck">AS</span> <span class="cs">'নাম'</span>, marks <span class="ck">AS</span> <span class="cs">'নম্বর'</span>
+<span class="ck">FROM</span> students;
+
+<span class="cm">-- ডুপ্লিকেট বাদ দিয়ে</span>
+<span class="ck">SELECT DISTINCT</span> boyosh <span class="ck">FROM</span> students;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">WHERE — শর্ত দিয়ে ফিল্টার <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- নির্দিষ্ট শর্তে দেখা</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks &gt; <span class="cn">80</span>;
+
+<span class="cm">-- AND দিয়ে একাধিক শর্ত</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks &gt; <span class="cn">80</span> <span class="ck">AND</span> boyosh &lt; <span class="cn">25</span>;
+
+<span class="cm">-- OR দিয়ে</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> naam = <span class="cs">'Maidul'</span> <span class="ck">OR</span> naam = <span class="cs">'Rahim'</span>;
+
+<span class="cm">-- IN দিয়ে তালিকা</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> naam <span class="ck">IN</span> (<span class="cs">'Maidul'</span>, <span class="cs">'Rahim'</span>, <span class="cs">'Karim'</span>);
+
+<span class="cm">-- BETWEEN দিয়ে রেঞ্জ</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks <span class="ck">BETWEEN</span> <span class="cn">70</span> <span class="ck">AND</span> <span class="cn">90</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">LIKE — আংশিক মিল খোঁজা</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#fbbf24">%</strong> — যেকোনো কিছু | <strong style="color:#fbbf24">_</strong> — যেকোনো একটি অক্ষর</p>
+    <pre><code><span class="cm">-- 'M' দিয়ে শুরু</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> naam <span class="ck">LIKE</span> <span class="cs">'M%'</span>;
+
+<span class="cm">-- 'dul' দিয়ে শেষ</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> naam <span class="ck">LIKE</span> <span class="cs">'%dul'</span>;
+
+<span class="cm">-- মাঝে 'ah' আছে</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> naam <span class="ck">LIKE</span> <span class="cs">'%ah%'</span>;
+
+<span class="cm">-- gmail ব্যবহারকারী</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">WHERE</span> email <span class="ck">LIKE</span> <span class="cs">'%@gmail.com'</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ORDER BY ও LIMIT</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- নম্বর অনুযায়ী ছোট থেকে বড়</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">ORDER BY</span> marks <span class="ck">ASC</span>;
+
+<span class="cm">-- নম্বর অনুযায়ী বড় থেকে ছোট</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">ORDER BY</span> marks <span class="ck">DESC</span>;
+
+<span class="cm">-- শুধু প্রথম ৫ জন</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">ORDER BY</span> marks <span class="ck">DESC</span>
+<span class="ck">LIMIT</span> <span class="cn">5</span>;
+
+<span class="cm">-- ৬ থেকে ১০ নম্বর রেকর্ড</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> students
+<span class="ck">LIMIT</span> <span class="cn">5</span> <span class="ck">OFFSET</span> <span class="cn">5</span>;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase p4" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৪</div>
+  <div class="phase-title">তথ্য পরিবর্তন ও মুছা<span class="phase-sub">UPDATE, DELETE</span></div>
+  <span class="phase-time">২-৩ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">UPDATE — তথ্য পরিবর্তন করা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>⚠️ সতর্কতা: WHERE ছাড়া UPDATE লিখলে সব রেকর্ড পরিবর্তন হয়ে যাবে!</p>
+    <pre><code><span class="cm">-- একটি রেকর্ড আপডেট</span>
+<span class="ck">UPDATE</span> students
+<span class="ck">SET</span> marks = <span class="cn">90.00</span>
+<span class="ck">WHERE</span> id = <span class="cn">1</span>;
+
+<span class="cm">-- একসাথে অনেক কলাম আপডেট</span>
+<span class="ck">UPDATE</span> students
+<span class="ck">SET</span> marks = <span class="cn">95.00</span>,
+    boyosh = <span class="cn">26</span>
+<span class="ck">WHERE</span> naam = <span class="cs">'Maidul'</span>;
+
+<span class="cm">-- শর্ত অনুযায়ী অনেক রেকর্ড</span>
+<span class="ck">UPDATE</span> students
+<span class="ck">SET</span> marks = marks + <span class="cn">5</span>
+<span class="ck">WHERE</span> marks &lt; <span class="cn">60</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">DELETE — তথ্য মুছা <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>⚠️ সতর্কতা: WHERE ছাড়া DELETE লিখলে টেবিলের সব তথ্য মুছে যাবে!</p>
+    <pre><code><span class="cm">-- একটি রেকর্ড মুছা</span>
+<span class="ck">DELETE FROM</span> students
+<span class="ck">WHERE</span> id = <span class="cn">3</span>;
+
+<span class="cm">-- শর্ত অনুযায়ী মুছা</span>
+<span class="ck">DELETE FROM</span> students
+<span class="ck">WHERE</span> marks &lt; <span class="cn">50</span>;
+
+<span class="cm">-- টেবিলের সব তথ্য মুছা (সাবধান!)</span>
+<span class="ck">DELETE FROM</span> students;
+
+<span class="cm">-- দ্রুত মুছার উপায় (reset করে)</span>
+<span class="ck">TRUNCATE TABLE</span> students;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ALTER TABLE — টেবিল পরিবর্তন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- নতুন কলাম যোগ</span>
+<span class="ck">ALTER TABLE</span> students
+<span class="ck">ADD</span> phone <span class="cf">VARCHAR(20)</span>;
+
+<span class="cm">-- কলাম পরিবর্তন</span>
+<span class="ck">ALTER TABLE</span> students
+<span class="ck">MODIFY</span> naam <span class="cf">VARCHAR(200)</span>;
+
+<span class="cm">-- কলাম মুছা</span>
+<span class="ck">ALTER TABLE</span> students
+<span class="ck">DROP COLUMN</span> phone;
+
+<span class="cm">-- টেবিলের নাম পরিবর্তন</span>
+<span class="ck">RENAME TABLE</span> students <span class="ck">TO</span> shikkharthi;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 5 -->
+<div class="phase p5" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৫</div>
+  <div class="phase-title">Aggregate Functions<span class="phase-sub">COUNT, SUM, AVG, MAX, MIN</span></div>
+  <span class="phase-time">৩-৪ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">COUNT, SUM, AVG, MAX, MIN <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- মোট ছাত্র সংখ্যা</span>
+<span class="ck">SELECT</span> <span class="cf">COUNT</span>(*) <span class="ck">AS</span> <span class="cs">'মোট ছাত্র'</span> <span class="ck">FROM</span> students;
+
+<span class="cm">-- সর্বোচ্চ নম্বর</span>
+<span class="ck">SELECT</span> <span class="cf">MAX</span>(marks) <span class="ck">AS</span> <span class="cs">'সর্বোচ্চ'</span> <span class="ck">FROM</span> students;
+
+<span class="cm">-- সর্বনিম্ন নম্বর</span>
+<span class="ck">SELECT</span> <span class="cf">MIN</span>(marks) <span class="ck">AS</span> <span class="cs">'সর্বনিম্ন'</span> <span class="ck">FROM</span> students;
+
+<span class="cm">-- গড় নম্বর</span>
+<span class="ck">SELECT</span> <span class="cf">AVG</span>(marks) <span class="ck">AS</span> <span class="cs">'গড়'</span> <span class="ck">FROM</span> students;
+
+<span class="cm">-- সব নম্বরের যোগফল</span>
+<span class="ck">SELECT</span> <span class="cf">SUM</span>(marks) <span class="ck">AS</span> <span class="cs">'যোগফল'</span> <span class="ck">FROM</span> students;
+
+<span class="cm">-- একসাথে সব</span>
+<span class="ck">SELECT</span>
+    <span class="cf">COUNT</span>(*) <span class="ck">AS</span> <span class="cs">'মোট'</span>,
+    <span class="cf">AVG</span>(marks) <span class="ck">AS</span> <span class="cs">'গড়'</span>,
+    <span class="cf">MAX</span>(marks) <span class="ck">AS</span> <span class="cs">'সর্বোচ্চ'</span>,
+    <span class="cf">MIN</span>(marks) <span class="ck">AS</span> <span class="cs">'সর্বনিম্ন'</span>
+<span class="ck">FROM</span> students;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">GROUP BY — গ্রুপ করে হিসাব <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- ধরুন students টেবিলে class কলাম আছে</span>
+<span class="cm">-- প্রতিটি ক্লাসে কতজন ছাত্র?</span>
+<span class="ck">SELECT</span> class, <span class="cf">COUNT</span>(*) <span class="ck">AS</span> <span class="cs">'ছাত্র সংখ্যা'</span>
+<span class="ck">FROM</span> students
+<span class="ck">GROUP BY</span> class;
+
+<span class="cm">-- প্রতিটি ক্লাসের গড় নম্বর</span>
+<span class="ck">SELECT</span> class,
+       <span class="cf">AVG</span>(marks) <span class="ck">AS</span> <span class="cs">'গড় নম্বর'</span>,
+       <span class="cf">COUNT</span>(*) <span class="ck">AS</span> <span class="cs">'ছাত্র'</span>
+<span class="ck">FROM</span> students
+<span class="ck">GROUP BY</span> class
+<span class="ck">ORDER BY</span> <span class="cf">AVG</span>(marks) <span class="ck">DESC</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">HAVING — গ্রুপের উপর শর্ত</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>WHERE → রেকর্ডের উপর শর্ত | HAVING → GROUP BY-এর পর শর্ত</p>
+    <pre><code><span class="cm">-- যে ক্লাসে ১০ জনের বেশি ছাত্র</span>
+<span class="ck">SELECT</span> class, <span class="cf">COUNT</span>(*) <span class="ck">AS</span> <span class="cs">'সংখ্যা'</span>
+<span class="ck">FROM</span> students
+<span class="ck">GROUP BY</span> class
+<span class="ck">HAVING</span> <span class="cf">COUNT</span>(*) &gt; <span class="cn">10</span>;
+
+<span class="cm">-- গড় নম্বর ৭৫ এর বেশি যে ক্লাসে</span>
+<span class="ck">SELECT</span> class, <span class="cf">AVG</span>(marks) <span class="ck">AS</span> <span class="cs">'গড়'</span>
+<span class="ck">FROM</span> students
+<span class="ck">GROUP BY</span> class
+<span class="ck">HAVING</span> <span class="cf">AVG</span>(marks) &gt; <span class="cn">75</span>;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 6 -->
+<div class="phase p6" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৬</div>
+  <div class="phase-title">JOIN — টেবিল একত্রিত করা<span class="phase-sub">INNER, LEFT, RIGHT JOIN</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">JOIN কী এবং কেন দরকার?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>দুটি টেবিলের মিলিত তথ্য একসাথে দেখার জন্য JOIN ব্যবহার হয়।</p>
+    <pre><code><span class="cm">-- students টেবিল: id, naam, class_id</span>
+<span class="cm">-- classes  টেবিল: id, class_naam</span>
+
+<span class="cm">-- এই দুটো মেলাতে JOIN লাগবে</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">INNER JOIN — উভয়ে মিলে যা আছে <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">SELECT</span>
+    s.naam <span class="ck">AS</span> <span class="cs">'ছাত্রের নাম'</span>,
+    c.class_naam <span class="ck">AS</span> <span class="cs">'ক্লাস'</span>,
+    s.marks <span class="ck">AS</span> <span class="cs">'নম্বর'</span>
+<span class="ck">FROM</span> students s
+<span class="ck">INNER JOIN</span> classes c
+    <span class="ck">ON</span> s.class_id = c.id;
+
+<span class="cm">-- শুধু ৮০+ নম্বরপ্রাপ্তদের</span>
+<span class="ck">SELECT</span> s.naam, c.class_naam, s.marks
+<span class="ck">FROM</span> students s
+<span class="ck">INNER JOIN</span> classes c <span class="ck">ON</span> s.class_id = c.id
+<span class="ck">WHERE</span> s.marks &gt; <span class="cn">80</span>
+<span class="ck">ORDER BY</span> s.marks <span class="ck">DESC</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">LEFT JOIN ও RIGHT JOIN</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#34d399">LEFT JOIN</strong> — বাম টেবিলের সব রেকর্ড, ডানে না মিললে NULL<br><strong style="color:#22d3ee">RIGHT JOIN</strong> — ডান টেবিলের সব রেকর্ড, বামে না মিললে NULL</p>
+    <pre><code><span class="cm">-- সব ছাত্র, ক্লাস না থাকলেও দেখাবে</span>
+<span class="ck">SELECT</span> s.naam, c.class_naam
+<span class="ck">FROM</span> students s
+<span class="ck">LEFT JOIN</span> classes c
+    <span class="ck">ON</span> s.class_id = c.id;
+
+<span class="cm">-- যাদের ক্লাস নেই (NULL)</span>
+<span class="ck">SELECT</span> s.naam
+<span class="ck">FROM</span> students s
+<span class="ck">LEFT JOIN</span> classes c <span class="ck">ON</span> s.class_id = c.id
+<span class="ck">WHERE</span> c.id <span class="ck">IS NULL</span>;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 7 -->
+<div class="phase p7" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৭</div>
+  <div class="phase-title">Subquery ও View<span class="phase-sub">ক্যোয়েরির ভেতরে ক্যোয়েরি</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Subquery — ক্যোয়েরির ভেতরে ক্যোয়েরি <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- গড়ের চেয়ে বেশি নম্বর পেয়েছে যারা</span>
+<span class="ck">SELECT</span> naam, marks
+<span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks &gt; (
+    <span class="ck">SELECT</span> <span class="cf">AVG</span>(marks) <span class="ck">FROM</span> students
+);
+
+<span class="cm">-- সর্বোচ্চ নম্বরপ্রাপ্ত ছাত্র</span>
+<span class="ck">SELECT</span> naam, marks
+<span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks = (
+    <span class="ck">SELECT</span> <span class="cf">MAX</span>(marks) <span class="ck">FROM</span> students
+);</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">VIEW — ভার্চুয়াল টেবিল <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>VIEW হলো একটি সংরক্ষিত SELECT ক্যোয়েরি। বারবার জটিল ক্যোয়েরি না লিখে View ব্যবহার করা যায়।</p>
+    <pre><code><span class="cm">-- View তৈরি</span>
+<span class="ck">CREATE VIEW</span> top_students <span class="ck">AS</span>
+<span class="ck">SELECT</span> naam, marks
+<span class="ck">FROM</span> students
+<span class="ck">WHERE</span> marks &gt;= <span class="cn">80</span>
+<span class="ck">ORDER BY</span> marks <span class="ck">DESC</span>;
+
+<span class="cm">-- View ব্যবহার (টেবিলের মতো)</span>
+<span class="ck">SELECT</span> * <span class="ck">FROM</span> top_students;
+
+<span class="cm">-- View মুছা</span>
+<span class="ck">DROP VIEW</span> top_students;</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- PHASE 8 -->
+<div class="phase p8" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৮</div>
+  <div class="phase-title">অ্যাডভান্সড ও পরবর্তী ধাপ<span class="phase-sub">Index, Transaction, Stored Procedure</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">INDEX — দ্রুত খোঁজার জন্য <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>বইয়ের সূচিপত্রের মতো — Index থাকলে ডেটা অনেক দ্রুত খোঁজা যায়।</p>
+    <pre><code><span class="cm">-- Index তৈরি</span>
+<span class="ck">CREATE INDEX</span> idx_naam
+<span class="ck">ON</span> students (naam);
+
+<span class="cm">-- Unique Index (ডুপ্লিকেট নেই)</span>
+<span class="ck">CREATE UNIQUE INDEX</span> idx_email
+<span class="ck">ON</span> students (email);
+
+<span class="cm">-- Index দেখা</span>
+<span class="ck">SHOW INDEX FROM</span> students;
+
+<span class="cm">-- Index মুছা</span>
+<span class="ck">DROP INDEX</span> idx_naam <span class="ck">ON</span> students;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">TRANSACTION — নিরাপদ অপারেশন <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Transaction দিয়ে একাধিক কাজ একসাথে করা হয়। কোনো একটি ভুল হলে সব পূর্বাবস্থায় ফিরে যায়।</p>
+    <pre><code><span class="cm">-- ব্যাংক ট্রান্সফারের উদাহরণ</span>
+<span class="ck">START TRANSACTION</span>;
+
+<span class="ck">UPDATE</span> accounts
+<span class="ck">SET</span> balance = balance - <span class="cn">500</span>
+<span class="ck">WHERE</span> id = <span class="cn">1</span>;  <span class="cm">-- A থেকে কাটা</span>
+
+<span class="ck">UPDATE</span> accounts
+<span class="ck">SET</span> balance = balance + <span class="cn">500</span>
+<span class="ck">WHERE</span> id = <span class="cn">2</span>;  <span class="cm">-- B-তে যোগ</span>
+
+<span class="cm">-- সফল হলে সেভ করো</span>
+<span class="ck">COMMIT</span>;
+
+<span class="cm">-- ভুল হলে ফিরিয়ে আনো</span>
+<span class="ck">ROLLBACK</span>;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">উপযোগী SQL ফাংশন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">-- স্ট্রিং ফাংশন</span>
+<span class="ck">SELECT</span> <span class="cf">UPPER</span>(naam) <span class="ck">FROM</span> students;   <span class="cm">-- বড় হাতে</span>
+<span class="ck">SELECT</span> <span class="cf">LOWER</span>(naam) <span class="ck">FROM</span> students;   <span class="cm">-- ছোট হাতে</span>
+<span class="ck">SELECT</span> <span class="cf">LENGTH</span>(naam) <span class="ck">FROM</span> students;  <span class="cm">-- অক্ষর সংখ্যা</span>
+<span class="ck">SELECT</span> <span class="cf">CONCAT</span>(naam, <span class="cs">' - '</span>, marks) <span class="ck">FROM</span> students;
+
+<span class="cm">-- সংখ্যা ফাংশন</span>
+<span class="ck">SELECT</span> <span class="cf">ROUND</span>(marks, <span class="cn">1</span>) <span class="ck">FROM</span> students; <span class="cm">-- গোলাকার</span>
+<span class="ck">SELECT</span> <span class="cf">ABS</span>(-<span class="cn">10</span>);                        <span class="cm">-- পরম মান → 10</span>
+
+<span class="cm">-- তারিখ ফাংশন</span>
+<span class="ck">SELECT</span> <span class="cf">NOW</span>();                 <span class="cm">-- বর্তমান সময়</span>
+<span class="ck">SELECT</span> <span class="cf">YEAR</span>(join_date) <span class="ck">FROM</span> students;
+<span class="ck">SELECT</span> <span class="cf">MONTH</span>(join_date) <span class="ck">FROM</span> students;</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🎯 পরবর্তী ধাপ — কোথায় যাবো?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm">১. PostgreSQL শিখুন
+   → আরো শক্তিশালী, চাকরির বাজারে চাহিদা বেশি
+
+২. Python + SQL
+   → SQLite3 বা SQLAlchemy দিয়ে
+   → ডেটা বিশ্লেষণে Pandas + SQL
+
+৩. Database Design
+   → ER Diagram
+   → Normalization (1NF, 2NF, 3NF)
+   → Foreign Key, Relationship
+
+৪. ব্যবহারিক প্রজেক্ট
+   → ছাত্র ব্যবস্থাপনা সিস্টেম
+   → ইনভেন্টরি সিস্টেম
+   → ব্লগ ডেটাবেস ডিজাইন
+
+৫. NoSQL (পরে)
+   → MongoDB — ডকুমেন্ট ভিত্তিক</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+</div><!-- end timeline -->
+
+<div class="tip-box">
+  <h3>💡 SQL শেখার টিপস</h3>
+  <ul>
+    <li>sqliteonline.com বা db-fiddle.com এ ব্রাউজারেই প্র্যাকটিস করুন</li>
+    <li>DELETE ও UPDATE লেখার আগে সবসময় WHERE শর্ত দিন</li>
+    <li>W3Schools SQL Tutorial — বাংলায় বোঝার জন্য সহজ</li>
+    <li>প্রতিদিন একটি ছোট প্রজেক্টের ডেটাবেস ডিজাইন করুন</li>
+    <li>SELECT শেখার পর JOIN — এটাই সবচেয়ে গুরুত্বপূর্ণ দক্ষতা</li>
+  </ul>
+</div>
+
+<script>
+function togglePhase(el) {
+  if (event.target.classList.contains('topic-check')) return;
+  if (event.target.closest('.topic-row')) return;
+  el.classList.toggle('open');
+}
+function toggleTopic(row) {
+  event.stopPropagation();
+  if (event.target.classList.contains('topic-check')) return;
+  row.closest('.topic-item').classList.toggle('open');
+}
+function doCheck(el, e) {
+  e.stopPropagation();
+  el.classList.toggle('checked');
+  updateProgress();
+}
+function updateProgress() {
+  const all = document.querySelectorAll('.topic-check').length;
+  const done = document.querySelectorAll('.topic-check.checked').length;
+  const pct = all > 0 ? Math.round((done/all)*100) : 0;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = done + ' / ' + all + ' টপিক সম্পন্ন';
+}
+async function copyCode() {
+  const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(document.documentElement.outerHTML);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  } catch(e) {
+    const ta = document.createElement('textarea');
+    ta.value = document.documentElement.outerHTML;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    btn.textContent = '✅ কপি হয়েছে!'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  }
+}
+updateProgress();
+document.querySelector('.phase').classList.add('open');
+</script>
+
+
+</body></html>

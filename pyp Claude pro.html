@@ -1,0 +1,1468 @@
+<html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Python শেখার রোডম্যাপ</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Hind Siliguri', sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px 60px; }
+  .header { text-align: center; margin-bottom: 40px; }
+  .header .badge { display: inline-block; background: linear-gradient(135deg,#6c63ff,#3ecf8e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px; }
+  .header h1 { font-size: clamp(26px,6vw,44px); font-weight: 700; color: #f1f5f9; line-height: 1.2; }
+  .header h1 span { background: linear-gradient(135deg,#6c63ff,#3ecf8e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header p { margin-top: 10px; color: #94a3b8; font-size: 15px; }
+
+  .copy-wrap { max-width: 720px; margin: 0 auto 20px; display: flex; justify-content: flex-end; }
+  #copyBtn { display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg,#6c63ff,#3ecf8e); color: #fff; border: none; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-family: 'Hind Siliguri', sans-serif; font-weight: 600; cursor: pointer; transition: opacity .2s, transform .1s; }
+  #copyBtn:active { transform: scale(.96); opacity: .85; }
+  #copyBtn.done { background: linear-gradient(135deg,#3ecf8e,#10b981); }
+
+  .progress-bar-wrap { max-width: 720px; margin: 0 auto 28px; }
+  .progress-info { display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 6px; }
+  .progress-track { height: 6px; background: #1e1e32; border-radius: 10px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg,#6c63ff,#3ecf8e); border-radius: 10px; transition: width .4s ease; width: 0%; }
+
+  .timeline { max-width: 720px; margin: 0 auto; position: relative; }
+  .timeline::before { content:''; position: absolute; left: 28px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom,#6c63ff44,#3ecf8e44); }
+
+  .phase { margin-bottom: 8px; position: relative; }
+  .phase-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px 14px 68px; background: #1e1e32; border: 1px solid #2a2a45; border-radius: 12px; cursor: pointer; transition: background .2s, border-color .2s; position: relative; user-select: none; }
+  .phase-header:hover { background: #252540; border-color: #3a3a60; }
+  .phase-dot { position: absolute; left: -44px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 50%; border: 3px solid; background: #0f0f1a; z-index: 1; }
+  .phase-number { font-size: 11px; font-weight: 700; letter-spacing: 1px; min-width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-title { flex: 1; font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .phase-sub { font-size: 11px; color: #64748b; font-weight: 400; display: block; margin-top: 2px; }
+  .phase-time { font-size: 11px; color: #64748b; background: #1a1a2e; border: 1px solid #2a2a45; padding: 3px 8px; border-radius: 20px; white-space: nowrap; }
+  .chevron { font-size: 11px; color: #4a5568; transition: transform .3s; flex-shrink: 0; }
+  .phase.open .chevron { transform: rotate(180deg); }
+
+  .topics { display: none; padding: 0 0 8px 68px; }
+  .phase.open .topics { display: block; }
+  .topics-inner { background: #16162a; border: 1px solid #2a2a45; border-top: none; border-radius: 0 0 12px 12px; padding: 12px; }
+
+  .topic-item { margin-bottom: 6px; border-radius: 8px; overflow: hidden; }
+  .topic-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; cursor: pointer; transition: background .15s; }
+  .topic-row:hover { background: #1e1e32; }
+  .topic-check { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #3a3a60; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; transition: all .2s; }
+  .topic-check.checked { border-color: #3ecf8e; background: #3ecf8e22; }
+  .topic-check.checked::after { content: '✓'; font-size: 11px; color: #3ecf8e; font-weight: 700; }
+  .topic-text { font-size: 14px; color: #cbd5e1; line-height: 1.5; flex: 1; }
+  .topic-tag { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .tag-imp { background: #7c3aed22; color: #a78bfa; border: 1px solid #7c3aed44; }
+  .tag-pro { background: #0369a122; color: #38bdf8; border: 1px solid #0369a144; }
+  .expand-icon { font-size: 10px; color: #4a5568; flex-shrink: 0; margin-top: 3px; transition: transform .2s; }
+  .topic-item.open .expand-icon { transform: rotate(90deg); }
+
+  .topic-detail { display: none; padding: 0 10px 12px 38px; }
+  .topic-item.open .topic-detail { display: block; }
+  .detail-box { background: #0f0f1a; border: 1px solid #2a2a45; border-radius: 8px; padding: 12px 14px; }
+  .detail-box p { font-size: 13px; color: #94a3b8; line-height: 1.7; margin-bottom: 8px; }
+  .detail-box p:last-child { margin-bottom: 0; }
+  pre { background: #1a1a2e; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin-top: 8px; }
+  code { font-family: 'Courier New', monospace; font-size: 12px; color: #7dd3fc; line-height: 1.6; white-space: pre; }
+  .cm { color: #64748b; }
+  .ck { color: #c084fc; }
+  .cs { color: #86efac; }
+  .cn { color: #fbbf24; }
+  .cf { color: #38bdf8; }
+
+  .p1 .phase-dot{border-color:#f59e0b} .p1 .phase-number{background:#f59e0b22;color:#f59e0b}
+  .p2 .phase-dot{border-color:#3b82f6} .p2 .phase-number{background:#3b82f622;color:#3b82f6}
+  .p3 .phase-dot{border-color:#8b5cf6} .p3 .phase-number{background:#8b5cf622;color:#8b5cf6}
+  .p4 .phase-dot{border-color:#ec4899} .p4 .phase-number{background:#ec489922;color:#ec4899}
+  .p5 .phase-dot{border-color:#10b981} .p5 .phase-number{background:#10b98122;color:#10b981}
+  .p6 .phase-dot{border-color:#f97316} .p6 .phase-number{background:#f9731622;color:#f97316}
+  .p7 .phase-dot{border-color:#06b6d4} .p7 .phase-number{background:#06b6d422;color:#06b6d4}
+  .p8 .phase-dot{border-color:#6c63ff} .p8 .phase-number{background:#6c63ff22;color:#6c63ff}
+  .p9 .phase-dot{border-color:#a855f7} .p9 .phase-number{background:#a855f722;color:#a855f7}
+  .p10 .phase-dot{border-color:#f43f5e} .p10 .phase-number{background:#f43f5e22;color:#f43f5e}
+
+  .tip-box { max-width: 720px; margin: 28px auto 0; background: #16162a; border: 1px solid #2a2a45; border-left: 3px solid #3ecf8e; border-radius: 10px; padding: 16px 20px; }
+  .tip-box h3 { font-size: 14px; color: #3ecf8e; margin-bottom: 8px; }
+  .tip-box ul { list-style: none; }
+  .tip-box li { font-size: 13px; color: #94a3b8; padding: 4px 0; }
+  .tip-box li::before { content: '→ '; color: #3ecf8e; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="header">
+  <div class="badge">📚 Complete Roadmap</div>
+  <h1>Python শেখার <span>A to Z গাইড</span></h1>
+  <p>প্রতিটি টপিকে ব্যাখ্যা ও কোড উদাহরণ সহ — ক্লিক করে বিস্তারিত দেখুন</p>
+</div>
+
+<div class="copy-wrap">
+  <button id="copyBtn" onclick="copyCode()">📋 HTML কোড কপি করুন</button>
+</div>
+
+<div class="progress-bar-wrap">
+  <div class="progress-info"><span>অগ্রগতি</span><span id="prog-text">0 / 46 টপিক সম্পন্ন</span></div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill" style="width: 0%;"></div></div>
+</div>
+
+<div class="timeline">
+
+<!-- ===== PHASE 1 ===== -->
+<div class="phase p1" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১</div>
+  <div class="phase-title">শুরুর প্রস্তুতি (Setup)<span class="phase-sub">Python ইনস্টল ও পরিবেশ তৈরি</span></div>
+  <span class="phase-time">১-২ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Python কী এবং কেন শিখবো?</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Python একটি সহজ, শক্তিশালী প্রোগ্রামিং ভাষা। ওয়েব, ডেটা সায়েন্স, AI, অটোমেশন — সব জায়গায় ব্যবহার হয়। ইংরেজির মতো পড়া যায় বলে শুরু করার জন্য সেরা।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Python ডাউনলোড ও ইনস্টল</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">python.org</strong> থেকে সর্বশেষ ভার্সন ডাউনলোড করুন। Windows-এ ইনস্টল করার সময় <strong style="color:#fbbf24">"Add Python to PATH"</strong> অবশ্যই টিক দিন।</p>
+    <p>ইনস্টল হয়েছে কিনা চেক করুন — cmd/terminal-এ টাইপ করুন:</p>
+    <pre><code>python --version</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">VS Code বা IDLE সেটআপ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">IDLE</strong> Python-এর সাথেই আসে — শুরুতে ব্যবহার করুন। <strong style="color:#f1f5f9">VS Code</strong> আরো শক্তিশালী — Python Extension ইনস্টল করতে হবে।</p>
+    <p>মোবাইলে কোড করতে চাইলে <strong style="color:#3ecf8e">Pydroid 3</strong> অ্যাপ ব্যবহার করুন (Android)।</p>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">প্রথম প্রোগ্রাম: Hello World</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>নিচের কোডটি লিখুন এবং Run করুন — স্ক্রিনে "Hello, World!" দেখাবে।</p>
+    <pre><code><span class="cf">print</span>(<span class="cs">"Hello, World!"</span>)
+<span class="cm"># আউটপুট: Hello, World!</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">কমেন্ট লেখা (#)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p># দিয়ে কমেন্ট লেখা হয় — Python এই লাইন রান করে না। কোড বোঝানোর জন্য ব্যবহার করুন।</p>
+    <pre><code><span class="cm"># এটি একটি কমেন্ট — রান হবে না</span>
+<span class="cf">print</span>(<span class="cs">"এটি রান হবে"</span>)  <span class="cm"># এটাও কমেন্ট</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 2 ===== -->
+<div class="phase p2" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">২</div>
+  <div class="phase-title">মূল ভিত্তি (Basics)<span class="phase-sub">ভেরিয়েবল, ডেটা টাইপ, অপারেটর</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ভেরিয়েবল ও অ্যাসাইনমেন্ট <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ভেরিয়েবল হলো তথ্য রাখার বাক্স। = চিহ্ন দিয়ে মান রাখা হয়।</p>
+    <pre><code>naam = <span class="cs">"Maidul"</span>       <span class="cm"># স্ট্রিং</span>
+boyosh = <span class="cn">25</span>           <span class="cm"># পূর্ণ সংখ্যা</span>
+gpa = <span class="cn">3.85</span>           <span class="cm"># দশমিক সংখ্যা</span>
+<span class="cf">print</span>(naam, boyosh)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ডেটা টাইপ: int, float, str, bool</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Python-এ ৪টি মূল ডেটা টাইপ আছে:</p>
+    <pre><code>x = <span class="cn">10</span>          <span class="cm"># int — পূর্ণ সংখ্যা</span>
+y = <span class="cn">3.14</span>        <span class="cm"># float — দশমিক</span>
+z = <span class="cs">"Python"</span>    <span class="cm"># str — টেক্সট</span>
+b = <span class="ck">True</span>        <span class="cm"># bool — সত্য/মিথ্যা</span>
+<span class="cf">print</span>(<span class="cf">type</span>(x))  <span class="cm"># আউটপুট: &lt;class 'int'&gt;</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item open">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">input() ও print() ফাংশন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>input() দিয়ে ব্যবহারকারীর কাছ থেকে তথ্য নেওয়া হয়। print() দিয়ে দেখানো হয়।</p>
+    <pre><code>naam = <span class="cf">input</span>(<span class="cs">"আপনার নাম লিখুন: "</span>)
+<span class="cf">print</span>(<span class="cs">"স্বাগতম,"</span>, naam)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item open">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">গাণিতিক অপারেটর</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>a, b = <span class="cn">10</span>, <span class="cn">3</span>
+<span class="cf">print</span>(a + b)   <span class="cm"># যোগ → 13</span>
+<span class="cf">print</span>(a - b)   <span class="cm"># বিয়োগ → 7</span>
+<span class="cf">print</span>(a * b)   <span class="cm"># গুণ → 30</span>
+<span class="cf">print</span>(a / b)   <span class="cm"># ভাগ → 3.333</span>
+<span class="cf">print</span>(a // b)  <span class="cm"># পূর্ণ ভাগ → 3</span>
+<span class="cf">print</span>(a % b)   <span class="cm"># ভাগশেষ → 1</span>
+<span class="cf">print</span>(a ** b)  <span class="cm"># ঘাত → 1000</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">তুলনামূলক অপারেটর</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>তুলনা করে True বা False রিটার্ন করে।</p>
+    <pre><code><span class="cf">print</span>(<span class="cn">5</span> == <span class="cn">5</span>)   <span class="cm"># সমান → True</span>
+<span class="cf">print</span>(<span class="cn">5</span> != <span class="cn">3</span>)   <span class="cm"># অসমান → True</span>
+<span class="cf">print</span>(<span class="cn">10</span> &gt; <span class="cn">3</span>)   <span class="cm"># বড় → True</span>
+<span class="cf">print</span>(<span class="cn">2</span> &gt;= <span class="cn">5</span>)   <span class="cm"># বড় বা সমান → False</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">লজিক্যাল অপারেটর (and, or, not)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>x = <span class="cn">10</span>
+<span class="cf">print</span>(x &gt; <span class="cn">5</span> <span class="ck">and</span> x &lt; <span class="cn">20</span>)  <span class="cm"># উভয় সত্য → True</span>
+<span class="cf">print</span>(x &gt; <span class="cn">5</span> <span class="ck">or</span> x &gt; <span class="cn">100</span>)  <span class="cm"># একটি সত্য → True</span>
+<span class="cf">print</span>(<span class="ck">not</span> (x &gt; <span class="cn">5</span>))         <span class="cm"># উল্টো → False</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">type() ও type conversion</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>x = <span class="cs">"25"</span>               <span class="cm"># এটি স্ট্রিং</span>
+x = <span class="cf">int</span>(x)            <span class="cm"># এখন পূর্ণ সংখ্যা</span>
+<span class="cf">print</span>(<span class="cf">type</span>(x))        <span class="cm"># &lt;class 'int'&gt;</span>
+
+y = <span class="cn">3.99</span>
+<span class="cf">print</span>(<span class="cf">int</span>(y))          <span class="cm"># 3 (দশমিক কাটা যায়)</span>
+<span class="cf">print</span>(<span class="cf">str</span>(<span class="cn">100</span>))        <span class="cm"># "100" স্ট্রিং হয়</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">String formatting (f-string) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>f-string দিয়ে সহজে ভেরিয়েবল টেক্সটের মধ্যে বসানো যায়।</p>
+    <pre><code>naam = <span class="cs">"Maidul"</span>
+boyosh = <span class="cn">25</span>
+<span class="cf">print</span>(<span class="cs">f"আমার নাম {naam}, বয়স {boyosh}"</span>)
+<span class="cm"># আউটপুট: আমার নাম Maidul, বয়স 25</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 3 ===== -->
+<div class="phase p3" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৩</div>
+  <div class="phase-title">কন্ট্রোল ফ্লো (Control Flow)<span class="phase-sub">শর্ত ও লুপ দিয়ে প্রোগ্রাম নিয়ন্ত্রণ</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item open">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">if / elif / else শর্ত <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>শর্ত সত্য হলে একটি কাজ, মিথ্যা হলে অন্য কাজ করানো যায়।</p>
+    <pre><code>marks = <span class="cn">75</span>
+<span class="ck">if</span> marks &gt;= <span class="cn">80</span>:
+    <span class="cf">print</span>(<span class="cs">"A+"</span>)
+<span class="ck">elif</span> marks &gt;= <span class="cn">70</span>:
+    <span class="cf">print</span>(<span class="cs">"A"</span>)    <span class="cm"># এটি প্রিন্ট হবে</span>
+<span class="ck">else</span>:
+    <span class="cf">print</span>(<span class="cs">"পাস করেছ"</span>)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Nested if (শর্তের ভেতর শর্ত)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>boyosh = <span class="cn">20</span>
+job = <span class="ck">True</span>
+<span class="ck">if</span> boyosh &gt;= <span class="cn">18</span>:
+    <span class="ck">if</span> job:
+        <span class="cf">print</span>(<span class="cs">"প্রাপ্তবয়স্ক ও চাকরিজীবী"</span>)
+    <span class="ck">else</span>:
+        <span class="cf">print</span>(<span class="cs">"প্রাপ্তবয়স্ক কিন্তু বেকার"</span>)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item open">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">for লুপ <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>নির্দিষ্ট কয়েকবার বা একটি লিস্টের প্রতিটি আইটেমের জন্য কাজ করায়।</p>
+    <pre><code><span class="cm"># ১ থেকে ৫ পর্যন্ত প্রিন্ট</span>
+<span class="ck">for</span> i <span class="ck">in</span> <span class="cf">range</span>(<span class="cn">1</span>, <span class="cn">6</span>):
+    <span class="cf">print</span>(i)
+
+<span class="cm"># লিস্টের প্রতিটি নাম</span>
+namer_list = [<span class="cs">"Alice"</span>, <span class="cs">"Bob"</span>, <span class="cs">"Rahim"</span>]
+<span class="ck">for</span> naam <span class="ck">in</span> namer_list:
+    <span class="cf">print</span>(naam)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">while লুপ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>শর্ত সত্য থাকা পর্যন্ত বারবার চলতে থাকে।</p>
+    <pre><code>count = <span class="cn">1</span>
+<span class="ck">while</span> count &lt;= <span class="cn">5</span>:
+    <span class="cf">print</span>(<span class="cs">f"চলছে: {count}"</span>)
+    count += <span class="cn">1</span>
+<span class="cm"># সাবধান! শর্ত কখনো মিথ্যা না হলে অসীম লুপ হবে</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">range() ফাংশন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cf">range</span>(<span class="cn">5</span>)         <span class="cm"># 0, 1, 2, 3, 4</span>
+<span class="cf">range</span>(<span class="cn">1</span>, <span class="cn">6</span>)      <span class="cm"># 1, 2, 3, 4, 5</span>
+<span class="cf">range</span>(<span class="cn">0</span>, <span class="cn">10</span>, <span class="cn">2</span>)  <span class="cm"># 0, 2, 4, 6, 8 (২ করে বাড়ে)</span>
+<span class="cf">range</span>(<span class="cn">10</span>, <span class="cn">0</span>, -<span class="cn">1</span>) <span class="cm"># 10 থেকে 1 (উল্টো)</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">break, continue, pass</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm"># break — লুপ থামিয়ে দেয়</span>
+<span class="ck">for</span> i <span class="ck">in</span> <span class="cf">range</span>(<span class="cn">10</span>):
+    <span class="ck">if</span> i == <span class="cn">5</span>: <span class="ck">break</span>
+    <span class="cf">print</span>(i)   <span class="cm"># 0 1 2 3 4</span>
+
+<span class="cm"># continue — এই ধাপ বাদ দেয়</span>
+<span class="ck">for</span> i <span class="ck">in</span> <span class="cf">range</span>(<span class="cn">5</span>):
+    <span class="ck">if</span> i == <span class="cn">2</span>: <span class="ck">continue</span>
+    <span class="cf">print</span>(i)   <span class="cm"># 0 1 3 4</span>
+
+<span class="cm"># pass — কিছু করে না (placeholder)</span>
+<span class="ck">if</span> <span class="ck">True</span>:
+    <span class="ck">pass</span>       <span class="cm"># পরে লিখবো</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 4 ===== -->
+<div class="phase p4" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৪</div>
+  <div class="phase-title">ডেটা স্ট্রাকচার<span class="phase-sub">List, Tuple, Set, Dictionary</span></div>
+  <span class="phase-time">১-২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">List তৈরি, অ্যাক্সেস, মডিফাই <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>List হলো ক্রমানুসারে সাজানো তথ্যের সংগ্রহ। [] ব্র্যাকেটে লেখা হয়।</p>
+    <pre><code>fruits = [<span class="cs">"আম"</span>, <span class="cs">"কলা"</span>, <span class="cs">"আপেল"</span>]
+<span class="cf">print</span>(fruits[<span class="cn">0</span>])    <span class="cm"># আম (প্রথম)</span>
+<span class="cf">print</span>(fruits[-<span class="cn">1</span>])   <span class="cm"># আপেল (শেষ)</span>
+fruits[<span class="cn">1</span>] = <span class="cs">"পেয়ারা"</span> <span class="cm"># পরিবর্তন করা</span>
+<span class="cf">print</span>(fruits)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">List মেথড: append, remove, sort, pop</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>items = [<span class="cn">3</span>, <span class="cn">1</span>, <span class="cn">4</span>, <span class="cn">1</span>, <span class="cn">5</span>]
+items.append(<span class="cn">9</span>)   <span class="cm"># শেষে যোগ → [3,1,4,1,5,9]</span>
+items.remove(<span class="cn">1</span>)   <span class="cm"># প্রথম 1 সরায় → [3,4,1,5,9]</span>
+items.pop()        <span class="cm"># শেষটা সরায় → [3,4,1,5]</span>
+items.sort()       <span class="cm"># ছোট→বড় সাজায় → [1,3,4,5]</span>
+<span class="cf">print</span>(<span class="cf">len</span>(items))  <span class="cm"># মোট সংখ্যা → 4</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">List Comprehension <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>এক লাইনে লিস্ট তৈরির ছোট উপায়।</p>
+    <pre><code><span class="cm"># ১ থেকে ১০ এর বর্গ</span>
+squares = [x**<span class="cn">2</span> <span class="ck">for</span> x <span class="ck">in</span> <span class="cf">range</span>(<span class="cn">1</span>, <span class="cn">11</span>)]
+<span class="cf">print</span>(squares)
+<span class="cm"># [1, 4, 9, 16, 25, 36, 49, 64, 81, 100]</span>
+
+<span class="cm"># শুধু জোড় সংখ্যা</span>
+even = [x <span class="ck">for</span> x <span class="ck">in</span> <span class="cf">range</span>(<span class="cn">20</span>) <span class="ck">if</span> x % <span class="cn">2</span> == <span class="cn">0</span>]</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Tuple (অপরিবর্তনীয় লিস্ট)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Tuple একবার তৈরি হলে পরিবর্তন করা যায় না। () ব্র্যাকেট ব্যবহার হয়।</p>
+    <pre><code>point = (<span class="cn">10</span>, <span class="cn">20</span>)
+<span class="cf">print</span>(point[<span class="cn">0</span>])   <span class="cm"># 10</span>
+<span class="cm"># point[0] = 5  → এরর দেবে!</span>
+
+<span class="cm"># একসাথে ভেরিয়েবলে রাখা</span>
+x, y = point
+<span class="cf">print</span>(x, y)        <span class="cm"># 10 20</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Set (অনন্য মান)</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Set-এ কোনো ডুপ্লিকেট থাকে না এবং ক্রম থাকে না। {} ব্র্যাকেট।</p>
+    <pre><code>nums = {<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">3</span>, <span class="cn">4</span>}
+<span class="cf">print</span>(nums)  <span class="cm"># {1, 2, 3, 4} — ডুপ্লিকেট নেই</span>
+
+a = {<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">3</span>}
+b = {<span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">4</span>}
+<span class="cf">print</span>(a &amp; b)  <span class="cm"># মিল: {2, 3}</span>
+<span class="cf">print</span>(a | b)  <span class="cm"># সব: {1, 2, 3, 4}</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Dictionary (key-value জোড়া) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Dictionary হলো চাবি-মান জোড়া। ফোনবুকের মতো — নাম দিলে নম্বর পাওয়া যায়।</p>
+    <pre><code>student = {
+    <span class="cs">"naam"</span>: <span class="cs">"Maidul"</span>,
+    <span class="cs">"boyosh"</span>: <span class="cn">25</span>,
+    <span class="cs">"subject"</span>: <span class="cs">"Python"</span>
+}
+<span class="cf">print</span>(student[<span class="cs">"naam"</span>])      <span class="cm"># Maidul</span>
+student[<span class="cs">"gpa"</span>] = <span class="cn">3.9</span>        <span class="cm"># নতুন যোগ</span>
+<span class="cf">print</span>(student.get(<span class="cs">"marks"</span>, <span class="cn">0</span>)) <span class="cm"># নেই → 0</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 5 ===== -->
+<div class="phase p5" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৫</div>
+  <div class="phase-title">ফাংশন (Functions)<span class="phase-sub">কোড পুনরায় ব্যবহারযোগ্য করা</span></div>
+  <span class="phase-time">১ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">def দিয়ে ফাংশন তৈরি <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ফাংশন হলো কোডের একটি নামযুক্ত ব্লক যা বারবার ব্যবহার করা যায়।</p>
+    <pre><code><span class="ck">def</span> <span class="cf">salam_dao</span>(naam):
+    <span class="cf">print</span>(<span class="cs">f"আস-সালামু আলাইকুম, {naam}!"</span>)
+
+salam_dao(<span class="cs">"Maidul"</span>)  <span class="cm"># ফাংশন কল করা</span>
+salam_dao(<span class="cs">"Rahim"</span>)
+<span class="cm"># দুটো আলাদা আউটপুট দেবে</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">return মান ফেরত দেওয়া</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">def</span> <span class="cf">jog_karo</span>(a, b):
+    <span class="ck">return</span> a + b
+
+result = jog_karo(<span class="cn">5</span>, <span class="cn">3</span>)
+<span class="cf">print</span>(result)  <span class="cm"># 8</span>
+
+<span class="cm"># একাধিক মান ফেরত</span>
+<span class="ck">def</span> <span class="cf">min_max</span>(lst):
+    <span class="ck">return</span> <span class="cf">min</span>(lst), <span class="cf">max</span>(lst)
+
+lo, hi = min_max([<span class="cn">3</span>, <span class="cn">1</span>, <span class="cn">7</span>, <span class="cn">2</span>])
+<span class="cf">print</span>(lo, hi)  <span class="cm"># 1 7</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Default parameter, *args, **kwargs</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm"># Default value</span>
+<span class="ck">def</span> <span class="cf">greet</span>(naam, bhasha=<span class="cs">"বাংলা"</span>):
+    <span class="cf">print</span>(<span class="cs">f"{naam} - {bhasha}"</span>)
+
+greet(<span class="cs">"Rahim"</span>)           <span class="cm"># Rahim - বাংলা</span>
+greet(<span class="cs">"John"</span>, <span class="cs">"English"</span>) <span class="cm"># John - English</span>
+
+<span class="cm"># *args — যেকোনো সংখ্যক আর্গুমেন্ট</span>
+<span class="ck">def</span> <span class="cf">jog</span>(*numbers):
+    <span class="ck">return</span> <span class="cf">sum</span>(numbers)
+
+<span class="cf">print</span>(jog(<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">4</span>))  <span class="cm"># 10</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Lambda ফাংশন</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>এক লাইনের ছোট ফাংশন। সাধারণত map/filter-এর সাথে ব্যবহার হয়।</p>
+    <pre><code>dwigun = <span class="ck">lambda</span> x: x * <span class="cn">2</span>
+<span class="cf">print</span>(dwigun(<span class="cn">5</span>))   <span class="cm"># 10</span>
+
+numbers = [<span class="cn">1</span>, <span class="cn">2</span>, <span class="cn">3</span>, <span class="cn">4</span>, <span class="cn">5</span>]
+doubled = <span class="cf">list</span>(<span class="cf">map</span>(<span class="ck">lambda</span> x: x*<span class="cn">2</span>, numbers))
+<span class="cf">print</span>(doubled)  <span class="cm"># [2, 4, 6, 8, 10]</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Recursive Function</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ফাংশন নিজেকে নিজে কল করে। Factorial বের করার উদাহরণ:</p>
+    <pre><code><span class="ck">def</span> <span class="cf">factorial</span>(n):
+    <span class="ck">if</span> n == <span class="cn">1</span>:
+        <span class="ck">return</span> <span class="cn">1</span>
+    <span class="ck">return</span> n * factorial(n - <span class="cn">1</span>)
+
+<span class="cf">print</span>(factorial(<span class="cn">5</span>))  <span class="cm"># 120 (5×4×3×2×1)</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 6 ===== -->
+<div class="phase p6" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৬</div>
+  <div class="phase-title">স্ট্রিং ও ফাইল<span class="phase-sub">টেক্সট প্রসেসিং ও ফাইল কাজ</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">String মেথড: upper, lower, strip, split, join, replace</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code>text = <span class="cs">"  Hello Python  "</span>
+<span class="cf">print</span>(text.strip())        <span class="cm"># ফাঁকা সরায়: "Hello Python"</span>
+<span class="cf">print</span>(text.upper())        <span class="cm"># "  HELLO PYTHON  "</span>
+<span class="cf">print</span>(text.lower())        <span class="cm"># "  hello python  "</span>
+<span class="cf">print</span>(text.replace(<span class="cs">"Hello"</span>, <span class="cs">"Hi"</span>))
+
+words = <span class="cs">"আম,কলা,আপেল"</span>
+lst = words.split(<span class="cs">","</span>)  <span class="cm"># ["আম","কলা","আপেল"]</span>
+<span class="cf">print</span>(<span class="cs">" - "</span>.join(lst))   <span class="cm"># আম - কলা - আপেল</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">ফাইল খোলা: open(), read(), write() <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm"># ফাইলে লেখা</span>
+<span class="ck">with</span> <span class="cf">open</span>(<span class="cs">"notun.txt"</span>, <span class="cs">"w"</span>, encoding=<span class="cs">"utf-8"</span>) <span class="ck">as</span> f:
+    f.write(<span class="cs">"আমার প্রথম ফাইল\n"</span>)
+    f.write(<span class="cs">"Python দিয়ে লেখা"</span>)
+
+<span class="cm"># ফাইল পড়া</span>
+<span class="ck">with</span> <span class="cf">open</span>(<span class="cs">"notun.txt"</span>, <span class="cs">"r"</span>, encoding=<span class="cs">"utf-8"</span>) <span class="ck">as</span> f:
+    content = f.read()
+    <span class="cf">print</span>(content)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">JSON ফাইল কাজ</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">import</span> json
+
+data = {<span class="cs">"naam"</span>: <span class="cs">"Maidul"</span>, <span class="cs">"boyosh"</span>: <span class="cn">25</span>}
+
+<span class="cm"># JSON ফাইলে সংরক্ষণ</span>
+<span class="ck">with</span> <span class="cf">open</span>(<span class="cs">"data.json"</span>, <span class="cs">"w"</span>) <span class="ck">as</span> f:
+    json.dump(data, f)
+
+<span class="cm"># JSON ফাইল পড়া</span>
+<span class="ck">with</span> <span class="cf">open</span>(<span class="cs">"data.json"</span>) <span class="ck">as</span> f:
+    loaded = json.load(f)
+    <span class="cf">print</span>(loaded[<span class="cs">"naam"</span>])  <span class="cm"># Maidul</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 7 ===== -->
+<div class="phase p7" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৭</div>
+  <div class="phase-title">OOP — অবজেক্ট ওরিয়েন্টেড<span class="phase-sub">Class, Object, Inheritance</span></div>
+  <span class="phase-time">২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Class ও Object কী? <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Class হলো ছাঁচ/ডিজাইন, Object হলো সেই ছাঁচ থেকে তৈরি জিনিস। যেমন "গাড়ির ডিজাইন" হলো class, আর "আপনার গাড়ি" হলো object।</p>
+    <pre><code><span class="ck">class</span> <span class="cf">Student</span>:
+    <span class="ck">def</span> <span class="cf">__init__</span>(self, naam, roll):
+        self.naam = naam
+        self.roll = roll
+
+    <span class="ck">def</span> <span class="cf">info</span>(self):
+        <span class="cf">print</span>(<span class="cs">f"{self.naam} - রোল: {self.roll}"</span>)
+
+s1 = Student(<span class="cs">"Maidul"</span>, <span class="cn">1</span>)  <span class="cm"># Object তৈরি</span>
+s1.info()  <span class="cm"># Maidul - রোল: 1</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Inheritance (উত্তরাধিকার) <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>একটি class আরেকটির সব গুণ নিয়ে নতুন কিছু যোগ করতে পারে।</p>
+    <pre><code><span class="ck">class</span> <span class="cf">Animal</span>:
+    <span class="ck">def</span> <span class="cf">shwas</span>(self):
+        <span class="cf">print</span>(<span class="cs">"শ্বাস নিচ্ছি"</span>)
+
+<span class="ck">class</span> <span class="cf">Dog</span>(Animal):  <span class="cm"># Animal থেকে নেওয়া</span>
+    <span class="ck">def</span> <span class="cf">bark</span>(self):
+        <span class="cf">print</span>(<span class="cs">"ঘেউ ঘেউ!"</span>)
+
+d = Dog()
+d.shwas()  <span class="cm"># শ্বাস নিচ্ছি (Animal থেকে)</span>
+d.bark()   <span class="cm"># ঘেউ ঘেউ! (Dog-এর নিজের)</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Encapsulation ও Polymorphism</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="cm"># Polymorphism — এক নাম, ভিন্ন কাজ</span>
+<span class="ck">class</span> <span class="cf">Cat</span>:
+    <span class="ck">def</span> <span class="cf">sound</span>(self): <span class="cf">print</span>(<span class="cs">"মিউ!"</span>)
+
+<span class="ck">class</span> <span class="cf">Dog</span>:
+    <span class="ck">def</span> <span class="cf">sound</span>(self): <span class="cf">print</span>(<span class="cs">"ঘেউ!"</span>)
+
+<span class="ck">for</span> animal <span class="ck">in</span> [Cat(), Dog()]:
+    animal.sound()  <span class="cm"># একই কল, আলাদা আউটপুট</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 8 ===== -->
+<div class="phase p8" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৮</div>
+  <div class="phase-title">Error Handling ও Modules<span class="phase-sub">ভুল সামলানো ও মডিউল ব্যবহার</span></div>
+  <span class="phase-time">৩-৫ দিন</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">try / except / finally <span class="topic-tag tag-imp">গুরুত্বপূর্ণ</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>প্রোগ্রাম ভুল করলে যেন ক্র্যাশ না করে — সেটা সামলানোর উপায়।</p>
+    <pre><code><span class="ck">try</span>:
+    x = <span class="cf">int</span>(<span class="cf">input</span>(<span class="cs">"সংখ্যা দিন: "</span>))
+    <span class="cf">print</span>(<span class="cn">10</span> / x)
+<span class="ck">except</span> <span class="cf">ValueError</span>:
+    <span class="cf">print</span>(<span class="cs">"সংখ্যা লিখুন!"</span>)
+<span class="ck">except</span> <span class="cf">ZeroDivisionError</span>:
+    <span class="cf">print</span>(<span class="cs">"শূন্য দিয়ে ভাগ হয় না!"</span>)
+<span class="ck">finally</span>:
+    <span class="cf">print</span>(<span class="cs">"সবসময় চলবে"</span>)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">গুরুত্বপূর্ণ বিল্ট-ইন মডিউল</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <pre><code><span class="ck">import</span> math
+<span class="cf">print</span>(math.sqrt(<span class="cn">16</span>))   <span class="cm"># 4.0 (বর্গমূল)</span>
+<span class="cf">print</span>(math.pi)          <span class="cm"># 3.14159...</span>
+
+<span class="ck">import</span> random
+<span class="cf">print</span>(random.randint(<span class="cn">1</span>, <span class="cn">10</span>))  <span class="cm"># ১-১০ র‍্যান্ডম</span>
+
+<span class="ck">import</span> datetime
+<span class="cf">print</span>(datetime.date.today())   <span class="cm"># আজকের তারিখ</span>
+
+<span class="ck">import</span> os
+<span class="cf">print</span>(os.getcwd())  <span class="cm"># বর্তমান ফোল্ডার</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">pip দিয়ে প্যাকেজ ইনস্টল</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Terminal/cmd-এ টাইপ করুন:</p>
+    <pre><code>pip install requests    <span class="cm"># ইন্টারনেট থেকে ডেটা নামানো</span>
+pip install pandas      <span class="cm"># ডেটা বিশ্লেষণ</span>
+pip install flask       <span class="cm"># ওয়েব অ্যাপ বানানো</span>
+pip list               <span class="cm"># ইনস্টল করা প্যাকেজ দেখা</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 9 ===== -->
+<div class="phase p9" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">৯</div>
+  <div class="phase-title">অ্যাডভান্সড টপিক<span class="phase-sub">Decorators, Generators, Regex</span></div>
+  <span class="phase-time">১-২ সপ্তাহ</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Decorator ফাংশন <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>একটি ফাংশনকে মোড়ক দিয়ে অতিরিক্ত কাজ করানো।</p>
+    <pre><code><span class="ck">def</span> <span class="cf">log_karo</span>(func):
+    <span class="ck">def</span> <span class="cf">wrapper</span>(*args):
+        <span class="cf">print</span>(<span class="cs">f"কল হচ্ছে: {func.__name__}"</span>)
+        <span class="ck">return</span> func(*args)
+    <span class="ck">return</span> wrapper
+
+@log_karo
+<span class="ck">def</span> <span class="cf">jog</span>(a, b):
+    <span class="ck">return</span> a + b
+
+jog(<span class="cn">3</span>, <span class="cn">4</span>)
+<span class="cm"># আউটপুট: কল হচ্ছে: jog → 7</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Generator ও yield <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>Generator একবারে সব না দিয়ে একটা একটা করে মান দেয় — মেমোরি সাশ্রয়ী।</p>
+    <pre><code><span class="ck">def</span> <span class="cf">count_karo</span>(n):
+    i = <span class="cn">0</span>
+    <span class="ck">while</span> i &lt; n:
+        <span class="ck">yield</span> i   <span class="cm"># একটা দিয়ে থামে</span>
+        i += <span class="cn">1</span>
+
+<span class="ck">for</span> num <span class="ck">in</span> count_karo(<span class="cn">5</span>):
+    <span class="cf">print</span>(num)  <span class="cm"># 0 1 2 3 4</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">Regular Expression — re মডিউল <span class="topic-tag tag-pro">অ্যাডভান্সড</span></div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>টেক্সটের মধ্যে প্যাটার্ন খোঁজার শক্তিশালী টুল।</p>
+    <pre><code><span class="ck">import</span> re
+
+text = <span class="cs">"আমার নম্বর 01711-123456"</span>
+phone = re.findall(<span class="cs">r'\d+'</span>, text)
+<span class="cf">print</span>(phone)  <span class="cm"># ['01711', '123456']</span>
+
+email = <span class="cs">"test@gmail.com"</span>
+<span class="ck">if</span> re.match(<span class="cs">r'\S+@\S+\.\S+'</span>, email):
+    <span class="cf">print</span>(<span class="cs">"বৈধ ইমেইল"</span>)</code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+<!-- ===== PHASE 10 ===== -->
+<div class="phase p10" onclick="togglePhase(this)">
+<div class="phase-header">
+  <div class="phase-dot"></div>
+  <div class="phase-number">১০</div>
+  <div class="phase-title">স্পেশালাইজেশন — পথ বেছে নাও<span class="phase-sub">নিজের লক্ষ্য অনুযায়ী শাখা বেছে নিন</span></div>
+  <span class="phase-time">চলমান</span>
+  <span class="chevron">▼</span>
+</div>
+<div class="topics"><div class="topics-inner">
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🌐 ওয়েব ডেভেলপমেন্ট → Django / Flask</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">Flask</strong> — ছোট ও সহজ। শুরুতে শিখুন। <strong style="color:#f1f5f9">Django</strong> — বড় ও শক্তিশালী। প্রফেশনাল ওয়েবসাইটের জন্য।</p>
+    <pre><code><span class="ck">from</span> flask <span class="ck">import</span> Flask
+app = Flask(__name__)
+
+@app.route(<span class="cs">"/"</span>)
+<span class="ck">def</span> <span class="cf">home</span>():
+    <span class="ck">return</span> <span class="cs">"স্বাগতম আমার ওয়েবসাইটে!"</span>
+
+app.run()</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">📊 ডেটা সায়েন্স → NumPy, Pandas, Matplotlib</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p><strong style="color:#f1f5f9">NumPy</strong> — গণনা। <strong style="color:#f1f5f9">Pandas</strong> — ডেটা বিশ্লেষণ। <strong style="color:#f1f5f9">Matplotlib</strong> — গ্রাফ ও চার্ট।</p>
+    <pre><code><span class="ck">import</span> pandas <span class="ck">as</span> pd
+data = {<span class="cs">"নাম"</span>: [<span class="cs">"Rahim"</span>, <span class="cs">"Karim"</span>], <span class="cs">"বয়স"</span>: [<span class="cn">25</span>, <span class="cn">30</span>]}
+df = pd.DataFrame(data)
+<span class="cf">print</span>(df)</code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🤖 AI/ML → Scikit-learn, TensorFlow</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>মেশিন লার্নিং দিয়ে কম্পিউটারকে শেখানো যায়। আগে ডেটা সায়েন্স শিখুন, তারপর AI।</p>
+    <pre><code><span class="ck">from</span> sklearn.linear_model <span class="ck">import</span> LinearRegression
+<span class="cm"># ডেটা দিন → মডেল ট্রেন করুন → ভবিষ্যৎ বলুন</span></code></pre>
+  </div></div>
+</div>
+
+<div class="topic-item">
+  <div class="topic-row" onclick="toggleTopic(this)">
+    <div class="topic-check" onclick="doCheck(this,event)"></div>
+    <div class="topic-text">🔧 অটোমেশন → Selenium, BeautifulSoup</div>
+    <span class="expand-icon">▶</span>
+  </div>
+  <div class="topic-detail"><div class="detail-box">
+    <p>ওয়েবসাইট থেকে ডেটা সংগ্রহ (scraping) বা ব্রাউজার অটোমেট করার জন্য।</p>
+    <pre><code><span class="ck">import</span> requests
+<span class="ck">from</span> bs4 <span class="ck">import</span> BeautifulSoup
+
+r = requests.get(<span class="cs">"https://example.com"</span>)
+soup = BeautifulSoup(r.text, <span class="cs">"html.parser"</span>)
+<span class="cf">print</span>(soup.title.text)  <span class="cm"># পেজের শিরোনাম</span></code></pre>
+  </div></div>
+</div>
+
+</div></div>
+</div>
+
+</div><!-- end timeline -->
+
+<div class="tip-box">
+  <h3>💡 শেখার টিপস</h3>
+  <ul>
+    <li>প্রতিদিন অন্তত ১ ঘণ্টা প্র্যাকটিস করুন</li>
+    <li>শুধু পড়বেন না — কোড লিখুন, ভুল করুন, শিখুন</li>
+    <li>প্রতিটি ধাপ শেষে একটা ছোট প্রজেক্ট বানান</li>
+    <li>Stack Overflow ও Python Docs আপনার বন্ধু</li>
+    <li>মোবাইলে Pydroid 3 অ্যাপে কোড প্র্যাকটিস করতে পারবেন</li>
+  </ul>
+</div>
+
+<script>
+function togglePhase(el) {
+  if (event.target.classList.contains('topic-check')) return;
+  if (event.target.closest('.topic-row')) return;
+  el.classList.toggle('open');
+}
+
+function toggleTopic(row) {
+  event.stopPropagation();
+  if (event.target.classList.contains('topic-check')) return;
+  const item = row.closest('.topic-item');
+  item.classList.toggle('open');
+}
+
+function doCheck(el, e) {
+  e.stopPropagation();
+  el.classList.toggle('checked');
+  updateProgress();
+}
+
+function updateProgress() {
+  const all = document.querySelectorAll('.topic-check').length;
+  const done = document.querySelectorAll('.topic-check.checked').length;
+  const pct = all > 0 ? Math.round((done / all) * 100) : 0;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = done + ' / ' + all + ' টপিক সম্পন্ন';
+}
+
+async function copyCode() {
+  const btn = document.getElementById('copyBtn');
+  try {
+    await navigator.clipboard.writeText(document.documentElement.outerHTML);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  } catch(e) {
+    const ta = document.createElement('textarea');
+    ta.value = document.documentElement.outerHTML;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✅ কপি হয়েছে!';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '📋 HTML কোড কপি করুন'; btn.classList.remove('done'); }, 2500);
+  }
+}
+
+updateProgress();
+document.querySelector('.phase').classList.add('open');
+</script>
+
+
+</body></html>

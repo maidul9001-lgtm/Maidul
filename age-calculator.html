@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>বয়স ক্যালকুলেটর</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0d0f1a;
+    --card: #141728;
+    --card2: #1a1f35;
+    --border: #252a45;
+    --accent: #7c6af7;
+    --accent2: #a78bfa;
+    --gold: #f59e0b;
+    --pink: #ec4899;
+    --green: #10b981;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --dim: #475569;
+  }
+
+  body {
+    font-family: 'Hind Siliguri', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px 40px;
+  }
+
+  /* Stars background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      radial-gradient(1px 1px at 15% 20%, #ffffff44 0%, transparent 100%),
+      radial-gradient(1px 1px at 60% 10%, #ffffff33 0%, transparent 100%),
+      radial-gradient(1.5px 1.5px at 80% 35%, #ffffff22 0%, transparent 100%),
+      radial-gradient(1px 1px at 30% 70%, #ffffff33 0%, transparent 100%),
+      radial-gradient(1px 1px at 90% 60%, #ffffff22 0%, transparent 100%),
+      radial-gradient(1px 1px at 45% 85%, #ffffff33 0%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .wrapper { position: relative; z-index: 1; width: 100%; max-width: 480px; }
+
+  /* Header */
+  .header {
+    text-align: center;
+    padding: 32px 0 28px;
+  }
+  .header-icon {
+    font-size: 48px;
+    display: block;
+    margin-bottom: 10px;
+    animation: float 3s ease-in-out infinite;
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
+  }
+  .header h1 {
+    font-size: 26px;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent2), var(--pink));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+  }
+  .header p { font-size: 14px; color: var(--muted); margin-top: 6px; }
+
+  /* Card */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+
+  .section-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent2);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 14px;
+  }
+
+  /* Input */
+  .input-group { position: relative; }
+  .input-group label {
+    display: block;
+    font-size: 14px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-weight: 500;
+  }
+  .date-input {
+    width: 100%;
+    background: var(--card2);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    color: var(--text);
+    font-size: 18px;
+    font-family: 'Hind Siliguri', sans-serif;
+    outline: none;
+    transition: border-color 0.2s;
+    cursor: pointer;
+  }
+  .date-input:focus { border-color: var(--accent); }
+  .date-input::-webkit-calendar-picker-indicator {
+    filter: invert(1) opacity(0.5);
+    cursor: pointer;
+  }
+
+  /* Button */
+  .calc-btn {
+    width: 100%;
+    margin-top: 20px;
+    padding: 15px;
+    background: linear-gradient(135deg, var(--accent), var(--pink));
+    border: none;
+    border-radius: 14px;
+    color: #fff;
+    font-size: 17px;
+    font-family: 'Hind Siliguri', sans-serif;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+    letter-spacing: 0.3px;
+  }
+  .calc-btn:hover { opacity: 0.9; }
+  .calc-btn:active { transform: scale(0.98); }
+
+  /* Results */
+  .result-section { display: none; }
+  .result-section.show { display: block; }
+
+  .age-display {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  .age-box {
+    flex: 1;
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 8px;
+    text-align: center;
+  }
+  .age-box .number {
+    font-size: 32px;
+    font-weight: 700;
+    line-height: 1;
+    background: linear-gradient(135deg, var(--accent2), var(--pink));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .age-box .unit {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 5px;
+  }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .stat-item {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .stat-item .stat-val {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--gold);
+    line-height: 1;
+  }
+  .stat-item .stat-lbl {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  /* Birthday countdown */
+  .bday-card {
+    background: linear-gradient(135deg, #1f1535, #1a1230);
+    border: 1px solid #3b2d6e;
+    border-radius: 16px;
+    padding: 20px;
+    text-align: center;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .bday-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at 50% 0%, #7c6af720 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .bday-emoji { font-size: 36px; margin-bottom: 8px; display: block; }
+  .bday-title { font-size: 15px; color: var(--accent2); font-weight: 600; margin-bottom: 4px; }
+  .bday-date-txt { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+
+  .countdown-row {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+  }
+  .cd-box {
+    background: #0d0f1a88;
+    border: 1px solid #3b2d6e;
+    border-radius: 10px;
+    padding: 10px 14px;
+    min-width: 64px;
+  }
+  .cd-num {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--accent2);
+    line-height: 1;
+  }
+  .cd-lbl { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+  .bday-today {
+    background: linear-gradient(135deg, #0f2a1a, #0a1f14);
+    border-color: #065f46;
+  }
+  .bday-today .bday-title { color: var(--green); }
+
+  /* Zodiac & day */
+  .info-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .info-box {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    text-align: center;
+  }
+  .info-box .info-icon { font-size: 24px; margin-bottom: 6px; }
+  .info-box .info-val { font-size: 15px; font-weight: 600; color: var(--text); }
+  .info-box .info-lbl { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+  /* Footer */
+  .footer { text-align: center; margin-top: 24px; font-size: 12px; color: var(--dim); }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <div class="header">
+    <span class="header-icon">🎂</span>
+    <h1>বয়স ক্যালকুলেটর</h1>
+    <p>আপনার জন্মতারিখ দিন, বাকিটা আমরা করব</p>
+  </div>
+
+  <!-- Input Card -->
+  <div class="card">
+    <div class="section-label">📅 জন্মতারিখ</div>
+    <div class="input-group">
+      <label for="dob">আপনার জন্মতারিখ লিখুন</label>
+      <input type="date" id="dob" class="date-input">
+    </div>
+    <button class="calc-btn" onclick="calculate()">✨ বয়স বের করুন</button>
+  </div>
+
+  <!-- Results -->
+  <div id="results" class="result-section">
+
+    <!-- Age -->
+    <div class="card">
+      <div class="section-label">⏳ আপনার বয়স</div>
+      <div class="age-display">
+        <div class="age-box">
+          <div class="number" id="years">0</div>
+          <div class="unit">বছর</div>
+        </div>
+        <div class="age-box">
+          <div class="number" id="months">0</div>
+          <div class="unit">মাস</div>
+        </div>
+        <div class="age-box">
+          <div class="number" id="days">0</div>
+          <div class="unit">দিন</div>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="stat-val" id="total-months">0</div>
+          <div class="stat-lbl">মোট মাস</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-val" id="total-weeks">0</div>
+          <div class="stat-lbl">মোট সপ্তাহ</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-val" id="total-days">0</div>
+          <div class="stat-lbl">মোট দিন</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-val" id="total-hours">0</div>
+          <div class="stat-lbl">মোট ঘণ্টা</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Birthday Countdown -->
+    <div id="bday-section" class="bday-card">
+      <span class="bday-emoji" id="bday-emoji">🎉</span>
+      <div class="bday-title" id="bday-title">পরবর্তী জন্মদিন</div>
+      <div class="bday-date-txt" id="bday-date-txt"></div>
+      <div class="countdown-row" id="countdown-row">
+        <div class="cd-box">
+          <div class="cd-num" id="cd-days">0</div>
+          <div class="cd-lbl">দিন</div>
+        </div>
+        <div class="cd-box">
+          <div class="cd-num" id="cd-hours">0</div>
+          <div class="cd-lbl">ঘণ্টা</div>
+        </div>
+        <div class="cd-box">
+          <div class="cd-num" id="cd-mins">0</div>
+          <div class="cd-lbl">মিনিট</div>
+        </div>
+        <div class="cd-box">
+          <div class="cd-num" id="cd-secs">0</div>
+          <div class="cd-lbl">সেকেন্ড</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Extra Info -->
+    <div class="card">
+      <div class="section-label">🔮 আরও তথ্য</div>
+      <div class="info-row">
+        <div class="info-box">
+          <div class="info-icon" id="zodiac-icon">♈</div>
+          <div class="info-val" id="zodiac-name">—</div>
+          <div class="info-lbl">রাশি</div>
+        </div>
+        <div class="info-box">
+          <div class="info-icon">📆</div>
+          <div class="info-val" id="birth-day">—</div>
+          <div class="info-lbl">জন্মবার</div>
+        </div>
+        <div class="info-box">
+          <div class="info-icon">🕯️</div>
+          <div class="info-val" id="next-age">—</div>
+          <div class="info-lbl">পরের জন্মদিনে বয়স</div>
+        </div>
+        <div class="info-box">
+          <div class="info-icon">💎</div>
+          <div class="info-val" id="birth-gem">—</div>
+          <div class="info-lbl">জন্মরত্ন</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">Maidul-এর জন্য তৈরি 💜</div>
+</div>
+
+<script>
+  let countdownTimer = null;
+
+  const banglaNum = n => String(n).replace(/\d/g, d => '০১২৩৪৫৬৭৮৯'[d]);
+
+  const bnMonths = ['জানুয়ারি','ফেব্রুয়ারি','মার্চ','এপ্রিল','মে','জুন',
+                    'জুলাই','আগস্ট','সেপ্টেম্বর','অক্টোবর','নভেম্বর','ডিসেম্বর'];
+  const bnDays  = ['রবিবার','সোমবার','মঙ্গলবার','বুধবার','বৃহস্পতিবার','শুক্রবার','শনিবার'];
+
+  const zodiacs = [
+    { name: 'মকর', icon: '♑', from: [12,22], to: [1,19] },
+    { name: 'কুম্ভ', icon: '♒', from: [1,20], to: [2,18] },
+    { name: 'মীন', icon: '♓', from: [2,19], to: [3,20] },
+    { name: 'মেষ', icon: '♈', from: [3,21], to: [4,19] },
+    { name: 'বৃষ', icon: '♉', from: [4,20], to: [5,20] },
+    { name: 'মিথুন', icon: '♊', from: [5,21], to: [6,20] },
+    { name: 'কর্কট', icon: '♋', from: [6,21], to: [7,22] },
+    { name: 'সিংহ', icon: '♌', from: [7,23], to: [8,22] },
+    { name: 'কন্যা', icon: '♍', from: [8,23], to: [9,22] },
+    { name: 'তুলা', icon: '♎', from: [9,23], to: [10,22] },
+    { name: 'বৃশ্চিক', icon: '♏', from: [10,23], to: [11,21] },
+    { name: 'ধনু', icon: '♐', from: [11,22], to: [12,21] },
+  ];
+
+  const gems = ['গার্নেট','অ্যামেথিস্ট','অ্যাকোয়ামেরিন','ডায়মন্ড','পান্না',
+                'আলেকজান্ড্রাইট','রুবি','পেরিডট','নীলকান্তমণি','ওপাল','টোপাজ','ফিরোজা'];
+
+  function getZodiac(month, day) {
+    const d = [month, day];
+    if ((d[0] === 12 && d[1] >= 22) || (d[0] === 1 && d[1] <= 19)) return zodiacs[0];
+    for (let i = 1; i < zodiacs.length; i++) {
+      const z = zodiacs[i];
+      if (d[0] === z.from[0] && d[1] >= z.from[1]) return z;
+      if (d[0] === z.to[0] && d[1] <= z.to[1]) return z;
+    }
+    return zodiacs[0];
+  }
+
+  function calculate() {
+    const dobVal = document.getElementById('dob').value;
+    if (!dobVal) { alert('অনুগ্রহ করে জন্মতারিখ দিন!'); return; }
+
+    const dob  = new Date(dobVal);
+    const now  = new Date();
+    if (dob > now) { alert('জন্মতারিখ ভবিষ্যতে হতে পারে না!'); return; }
+
+    // Age calculation
+    let y = now.getFullYear() - dob.getFullYear();
+    let m = now.getMonth()    - dob.getMonth();
+    let d = now.getDate()     - dob.getDate();
+    if (d < 0) { m--; const prev = new Date(now.getFullYear(), now.getMonth(), 0); d += prev.getDate(); }
+    if (m < 0) { y--; m += 12; }
+
+    document.getElementById('years').textContent  = banglaNum(y);
+    document.getElementById('months').textContent = banglaNum(m);
+    document.getElementById('days').textContent   = banglaNum(d);
+
+    const totalDays   = Math.floor((now - dob) / 86400000);
+    const totalMonths = y * 12 + m;
+    const totalWeeks  = Math.floor(totalDays / 7);
+    const totalHours  = totalDays * 24;
+
+    document.getElementById('total-months').textContent = banglaNum(totalMonths.toLocaleString());
+    document.getElementById('total-weeks').textContent  = banglaNum(totalWeeks.toLocaleString());
+    document.getElementById('total-days').textContent   = banglaNum(totalDays.toLocaleString());
+    document.getElementById('total-hours').textContent  = banglaNum(totalHours.toLocaleString());
+
+    // Zodiac
+    const zodiac = getZodiac(dob.getMonth() + 1, dob.getDate());
+    document.getElementById('zodiac-icon').textContent = zodiac.icon;
+    document.getElementById('zodiac-name').textContent = zodiac.name;
+
+    // Birth day
+    document.getElementById('birth-day').textContent = bnDays[dob.getDay()];
+
+    // Gem
+    document.getElementById('birth-gem').textContent = gems[dob.getMonth()];
+
+    // Next birthday
+    startBirthdayCountdown(dob, y);
+
+    // Show results
+    document.getElementById('results').classList.add('show');
+    document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function startBirthdayCountdown(dob, currentAge) {
+    if (countdownTimer) clearInterval(countdownTimer);
+
+    function update() {
+      const now  = new Date();
+      const thisYear = now.getFullYear();
+      let nextBday = new Date(thisYear, dob.getMonth(), dob.getDate());
+      if (nextBday < now) nextBday.setFullYear(thisYear + 1);
+
+      const isTodayBday = (dob.getMonth() === now.getMonth() && dob.getDate() === now.getDate());
+      const sec = document.getElementById('bday-section');
+
+      document.getElementById('next-age').textContent = banglaNum(
+        isTodayBday ? currentAge : currentAge + 1
+      );
+
+      if (isTodayBday) {
+        sec.className = 'bday-card bday-today';
+        document.getElementById('bday-emoji').textContent = '🎊';
+        document.getElementById('bday-title').textContent = '🎉 আজ আপনার জন্মদিন!';
+        document.getElementById('bday-date-txt').textContent = 'জন্মদিনের শুভেচ্ছা! 🥳';
+        document.getElementById('countdown-row').innerHTML =
+          `<div style="font-size:28px;font-weight:700;color:var(--green);padding:10px 0">
+            অনেক অনেক শুভকামনা! 🌟</div>`;
+        clearInterval(countdownTimer);
+        return;
+      }
+
+      sec.className = 'bday-card';
+      document.getElementById('bday-emoji').textContent = '🎂';
+      document.getElementById('bday-title').textContent = 'পরবর্তী জন্মদিন';
+
+      const monthName = bnMonths[nextBday.getMonth()];
+      const dateStr = `${banglaNum(nextBday.getDate())} ${monthName} ${banglaNum(nextBday.getFullYear())}`;
+      document.getElementById('bday-date-txt').textContent = dateStr;
+
+      const diff = nextBday - now;
+      const dd = Math.floor(diff / 86400000);
+      const hh = Math.floor((diff % 86400000) / 3600000);
+      const mm = Math.floor((diff % 3600000) / 60000);
+      const ss = Math.floor((diff % 60000) / 1000);
+
+      document.getElementById('cd-days').textContent  = banglaNum(dd);
+      document.getElementById('cd-hours').textContent = banglaNum(hh);
+      document.getElementById('cd-mins').textContent  = banglaNum(mm);
+      document.getElementById('cd-secs').textContent  = banglaNum(ss);
+    }
+
+    update();
+    countdownTimer = setInterval(update, 1000);
+  }
+</script>
+</body>
+</html>

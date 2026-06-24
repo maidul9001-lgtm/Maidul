@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BMI ক্যালকুলেটর</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #080c14;
+    --card: #0f1420;
+    --card2: #151c2e;
+    --border: #1e2740;
+    --text: #e2e8f0;
+    --muted: #8892a4;
+    --dim: #3d4a61;
+
+    --underweight: #38bdf8;
+    --normal:      #22c55e;
+    --overweight:  #f59e0b;
+    --obese:       #ef4444;
+  }
+
+  body {
+    font-family: 'Hind Siliguri', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px 48px;
+  }
+
+  /* Subtle grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: linear-gradient(var(--border) 1px, transparent 1px),
+                      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: 0.3;
+    pointer-events: none;
+  }
+
+  .wrapper { position: relative; z-index: 1; width: 100%; max-width: 460px; }
+
+  /* ── Header ── */
+  .header { text-align: center; padding: 32px 0 26px; }
+  .header-badge {
+    display: inline-block;
+    background: #1a2340;
+    border: 1px solid #2a3a60;
+    border-radius: 50px;
+    padding: 6px 16px;
+    font-size: 12px;
+    color: #60a5fa;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.5px;
+    line-height: 1.2;
+  }
+  .header h1 span {
+    background: linear-gradient(90deg, #60a5fa, #34d399);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .header p { font-size: 14px; color: var(--muted); margin-top: 8px; }
+
+  /* ── Card ── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 22px;
+    margin-bottom: 14px;
+  }
+
+  .section-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #60a5fa;
+    text-transform: uppercase;
+    letter-spacing: 1.8px;
+    margin-bottom: 16px;
+  }
+
+  /* ── Toggle: kg/cm vs lb/ft ── */
+  .unit-toggle {
+    display: flex;
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px;
+    margin-bottom: 20px;
+    gap: 4px;
+  }
+  .unit-toggle button {
+    flex: 1;
+    padding: 8px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font-family: 'Hind Siliguri', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+  .unit-toggle button.active {
+    background: #1e3a5f;
+    color: #60a5fa;
+  }
+
+  /* ── Slider inputs ── */
+  .input-row { margin-bottom: 18px; }
+  .input-row label {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 14px;
+    color: var(--muted);
+    font-weight: 500;
+    margin-bottom: 10px;
+  }
+  .input-row label .val-badge {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .input-row label .val-badge sup {
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 3px;
+  }
+
+  input[type=range] {
+    width: 100%;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    border-radius: 10px;
+    outline: none;
+    cursor: pointer;
+    background: var(--border);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: #60a5fa;
+    border: 3px solid var(--card);
+    box-shadow: 0 0 8px #60a5fa66;
+    cursor: pointer;
+    transition: transform 0.15s;
+  }
+  input[type=range]:active::-webkit-slider-thumb { transform: scale(1.2); }
+
+  /* Gender toggle */
+  .gender-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .gender-btn {
+    flex: 1;
+    padding: 12px;
+    background: var(--card2);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    color: var(--muted);
+    font-family: 'Hind Siliguri', sans-serif;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+  .gender-btn .g-icon { font-size: 24px; }
+  .gender-btn.active { border-color: #60a5fa; color: #60a5fa; background: #0d1e36; }
+
+  /* ── Calculate button ── */
+  .calc-btn {
+    width: 100%;
+    padding: 15px;
+    background: linear-gradient(135deg, #1d4ed8, #0891b2);
+    border: none;
+    border-radius: 14px;
+    color: #fff;
+    font-size: 17px;
+    font-family: 'Hind Siliguri', sans-serif;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+  .calc-btn:hover { opacity: 0.9; }
+  .calc-btn:active { transform: scale(0.98); }
+
+  /* ── Result section ── */
+  .result-section { display: none; }
+  .result-section.show { display: block; }
+
+  /* BMI Gauge */
+  .gauge-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px 0 6px;
+  }
+  .gauge-svg-wrap { position: relative; width: 240px; height: 130px; }
+  .gauge-svg-wrap svg { width: 100%; height: 100%; }
+
+  .gauge-value-block {
+    position: absolute;
+    bottom: 0; left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+  }
+  .gauge-bmi-num {
+    font-size: 44px;
+    font-weight: 700;
+    line-height: 1;
+    transition: color 0.4s;
+  }
+  .gauge-bmi-label {
+    font-size: 15px;
+    font-weight: 600;
+    margin-top: 4px;
+    transition: color 0.4s;
+  }
+
+  /* Category bar */
+  .cat-bar {
+    display: flex;
+    border-radius: 8px;
+    overflow: hidden;
+    height: 8px;
+    width: 100%;
+    margin: 18px 0 14px;
+    gap: 3px;
+  }
+  .cat-bar-seg { flex: 1; border-radius: 4px; opacity: 0.4; transition: opacity 0.3s; }
+  .cat-bar-seg.active { opacity: 1; }
+  .cat-bar-seg.underweight { background: var(--underweight); }
+  .cat-bar-seg.normal      { background: var(--normal); flex: 2; }
+  .cat-bar-seg.overweight  { background: var(--overweight); }
+  .cat-bar-seg.obese       { background: var(--obese); }
+
+  .cat-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--dim);
+    margin-bottom: 18px;
+    padding: 0 2px;
+  }
+
+  /* Stats row */
+  .stats-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 0;
+  }
+  .stat-box {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 10px;
+    text-align: center;
+  }
+  .stat-box .s-val {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1;
+  }
+  .stat-box .s-lbl {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 5px;
+    line-height: 1.3;
+  }
+
+  /* Health tips */
+  .tip-card {
+    border-radius: 14px;
+    padding: 18px;
+    border: 1px solid;
+    margin-bottom: 0;
+  }
+  .tip-card .tip-head {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tip-card ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .tip-card ul li {
+    font-size: 13.5px;
+    color: var(--muted);
+    padding-left: 18px;
+    position: relative;
+    line-height: 1.5;
+  }
+  .tip-card ul li::before {
+    content: '→';
+    position: absolute;
+    left: 0;
+    font-size: 12px;
+  }
+
+  /* Ideal weight note */
+  .ideal-note {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 1.6;
+    margin-bottom: 0;
+  }
+  .ideal-note strong { color: #60a5fa; font-weight: 600; }
+
+  .footer {
+    text-align: center;
+    margin-top: 28px;
+    font-size: 12px;
+    color: var(--dim);
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-badge">⚕️ স্বাস্থ্য পরীক্ষা</div>
+    <h1>আপনার <span>BMI</span> জানুন</h1>
+    <p>Body Mass Index — স্বাস্থ্যকর ওজনের পরিমাপ</p>
+  </div>
+
+  <!-- Input Card -->
+  <div class="card">
+    <div class="section-label">📐 তথ্য দিন</div>
+
+    <!-- Unit toggle -->
+    <div class="unit-toggle">
+      <button class="active" id="btn-metric" onclick="setUnit('metric')">কেজি / সেমি</button>
+      <button id="btn-imperial" onclick="setUnit('imperial')">পাউন্ড / ফুট</button>
+    </div>
+
+    <!-- Gender -->
+    <div class="gender-row">
+      <button class="gender-btn active" id="btn-male" onclick="setGender('male')">
+        <span class="g-icon">♂️</span> পুরুষ
+      </button>
+      <button class="gender-btn" id="btn-female" onclick="setGender('female')">
+        <span class="g-icon">♀️</span> মহিলা
+      </button>
+    </div>
+
+    <!-- Height -->
+    <div class="input-row">
+      <label>
+        <span>উচ্চতা</span>
+        <span class="val-badge"><span id="height-display">170</span><sup id="height-unit">সেমি</sup></span>
+      </label>
+      <input type="range" id="height-slider" min="100" max="220" value="170" oninput="updateHeight(this.value)">
+    </div>
+
+    <!-- Weight -->
+    <div class="input-row">
+      <label>
+        <span>ওজন</span>
+        <span class="val-badge"><span id="weight-display">65</span><sup id="weight-unit">কেজি</sup></span>
+      </label>
+      <input type="range" id="weight-slider" min="30" max="200" value="65" oninput="updateWeight(this.value)">
+    </div>
+
+    <!-- Age -->
+    <div class="input-row">
+      <label>
+        <span>বয়স</span>
+        <span class="val-badge"><span id="age-display">25</span><sup>বছর</sup></span>
+      </label>
+      <input type="range" id="age-slider" min="5" max="100" value="25" oninput="updateAge(this.value)">
+    </div>
+
+    <button class="calc-btn" onclick="calculate()">⚡ BMI হিসাব করুন</button>
+  </div>
+
+  <!-- Result Section -->
+  <div id="result-section" class="result-section">
+
+    <!-- Gauge Card -->
+    <div class="card">
+      <div class="section-label">📊 আপনার ফলাফল</div>
+
+      <div class="gauge-wrap">
+        <div class="gauge-svg-wrap">
+          <svg viewBox="0 0 240 130" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <!-- Track -->
+            <path d="M20 120 A100 100 0 0 1 220 120" stroke="#1e2740" stroke-width="18" stroke-linecap="round"/>
+            <!-- Colored segments -->
+            <path d="M20 120 A100 100 0 0 1 74 37" stroke="#38bdf8" stroke-width="18" stroke-linecap="round" opacity="0.35" id="seg-under"/>
+            <path d="M74 37 A100 100 0 0 1 154 22" stroke="#22c55e" stroke-width="18" stroke-linecap="round" opacity="0.35" id="seg-normal"/>
+            <path d="M154 22 A100 100 0 0 1 202 57" stroke="#f59e0b" stroke-width="18" stroke-linecap="round" opacity="0.35" id="seg-over"/>
+            <path d="M202 57 A100 100 0 0 1 220 120" stroke="#ef4444" stroke-width="18" stroke-linecap="round" opacity="0.35" id="seg-obese"/>
+            <!-- Needle -->
+            <line id="needle" x1="120" y1="120" x2="120" y2="30" stroke="#fff" stroke-width="2.5" stroke-linecap="round" transform-origin="120 120"/>
+            <circle cx="120" cy="120" r="6" fill="#fff"/>
+          </svg>
+          <div class="gauge-value-block">
+            <div class="gauge-bmi-num" id="bmi-num">—</div>
+            <div class="gauge-bmi-label" id="bmi-label">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Category bar -->
+      <div class="cat-bar">
+        <div class="cat-bar-seg underweight" id="cb-under"></div>
+        <div class="cat-bar-seg normal" id="cb-normal"></div>
+        <div class="cat-bar-seg overweight" id="cb-over"></div>
+        <div class="cat-bar-seg obese" id="cb-obese"></div>
+      </div>
+      <div class="cat-labels">
+        <span>কম ওজন<br>&lt;18.5</span>
+        <span style="text-align:center">স্বাভাবিক<br>18.5–24.9</span>
+        <span style="text-align:center">বেশি ওজন<br>25–29.9</span>
+        <span style="text-align:right">স্থূলকায়<br>≥30</span>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row">
+        <div class="stat-box">
+          <div class="s-val" id="stat-bmi">—</div>
+          <div class="s-lbl">BMI স্কোর</div>
+        </div>
+        <div class="stat-box">
+          <div class="s-val" id="stat-ideal">—</div>
+          <div class="s-lbl">আদর্শ ওজন (কেজি)</div>
+        </div>
+        <div class="stat-box">
+          <div class="s-val" id="stat-diff">—</div>
+          <div class="s-lbl">পার্থক্য (কেজি)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Ideal weight note -->
+    <div class="card">
+      <div class="ideal-note" id="ideal-note">—</div>
+    </div>
+
+    <!-- Tips Card -->
+    <div class="card">
+      <div class="tip-card" id="tip-card">
+        <div class="tip-head" id="tip-head">—</div>
+        <ul id="tip-list"></ul>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">স্বাস্থ্যই সম্পদ 💙 | শুধুমাত্র তথ্যের জন্য, চিকিৎসকের পরামর্শ নিন</div>
+</div>
+
+<script>
+  let unit = 'metric';
+  let gender = 'male';
+
+  const bn = n => String(n).replace(/\d/g, d => '০১২৩৪৫৬৭৮৯'[d]);
+
+  function setUnit(u) {
+    unit = u;
+    document.getElementById('btn-metric').classList.toggle('active', u === 'metric');
+    document.getElementById('btn-imperial').classList.toggle('active', u === 'imperial');
+
+    const hs = document.getElementById('height-slider');
+    const ws = document.getElementById('weight-slider');
+
+    if (u === 'metric') {
+      hs.min = 100; hs.max = 220; hs.value = 170;
+      ws.min = 30;  ws.max = 200; ws.value = 65;
+      document.getElementById('height-unit').textContent = 'সেমি';
+      document.getElementById('weight-unit').textContent = 'কেজি';
+    } else {
+      hs.min = 48; hs.max = 84; hs.value = 67;
+      ws.min = 66; ws.max = 440; ws.value = 143;
+      document.getElementById('height-unit').textContent = 'ইঞ্চি';
+      document.getElementById('weight-unit').textContent = 'পাউন্ড';
+    }
+    updateHeight(hs.value);
+    updateWeight(ws.value);
+  }
+
+  function setGender(g) {
+    gender = g;
+    document.getElementById('btn-male').classList.toggle('active', g === 'male');
+    document.getElementById('btn-female').classList.toggle('active', g === 'female');
+  }
+
+  function updateHeight(v) {
+    let display = v;
+    if (unit === 'imperial') {
+      const ft = Math.floor(v / 12), inch = v % 12;
+      display = `${ft}′${inch}″`;
+    }
+    document.getElementById('height-display').textContent = display;
+  }
+
+  function updateWeight(v) {
+    document.getElementById('weight-display').textContent = v;
+  }
+
+  function updateAge(v) {
+    document.getElementById('age-display').textContent = v;
+  }
+
+  function calculate() {
+    let hSlider = parseFloat(document.getElementById('height-slider').value);
+    let wSlider = parseFloat(document.getElementById('weight-slider').value);
+
+    let heightM, weightKg;
+    if (unit === 'metric') {
+      heightM = hSlider / 100;
+      weightKg = wSlider;
+    } else {
+      heightM = hSlider * 0.0254;
+      weightKg = wSlider * 0.453592;
+    }
+
+    const bmi = weightKg / (heightM * heightM);
+    const bmiRound = Math.round(bmi * 10) / 10;
+
+    // Ideal weight (Devine formula)
+    const heightCm = heightM * 100;
+    let idealKg;
+    if (gender === 'male') {
+      idealKg = 50 + 0.906 * (heightCm - 152.4) / 2.54;
+    } else {
+      idealKg = 45.5 + 0.906 * (heightCm - 152.4) / 2.54;
+    }
+    idealKg = Math.max(40, idealKg);
+    const idealRound = Math.round(idealKg * 10) / 10;
+    const diff = Math.round((weightKg - idealKg) * 10) / 10;
+
+    // Category
+    let cat, color, catKey;
+    if (bmi < 18.5)      { cat = 'কম ওজন (Underweight)'; color = '#38bdf8'; catKey = 'under'; }
+    else if (bmi < 25)   { cat = 'স্বাভাবিক (Normal)';    color = '#22c55e'; catKey = 'normal'; }
+    else if (bmi < 30)   { cat = 'বেশি ওজন (Overweight)'; color = '#f59e0b'; catKey = 'over'; }
+    else                  { cat = 'স্থূলকায় (Obese)';     color = '#ef4444'; catKey = 'obese'; }
+
+    // Update gauge
+    document.getElementById('bmi-num').textContent = bmiRound.toFixed(1);
+    document.getElementById('bmi-num').style.color = color;
+    document.getElementById('bmi-label').textContent = cat;
+    document.getElementById('bmi-label').style.color = color;
+
+    // Needle angle: BMI 10→40 maps to -90°→+90°
+    const angle = Math.min(90, Math.max(-90, ((bmi - 10) / 30) * 180 - 90));
+    document.getElementById('needle').setAttribute('transform', `rotate(${angle}, 120, 120)`);
+
+    // Highlight arc segment
+    ['under','normal','over','obese'].forEach(k => {
+      document.getElementById(`seg-${k}`).style.opacity = k === catKey ? '1' : '0.25';
+    });
+
+    // Category bar
+    ['under','normal','over','obese'].forEach(k => {
+      const el = document.getElementById(`cb-${k}`);
+      el.classList.toggle('active', k === catKey);
+    });
+
+    // Stats
+    document.getElementById('stat-bmi').textContent = bmiRound.toFixed(1);
+    document.getElementById('stat-ideal').textContent = idealRound;
+    const diffSign = diff > 0 ? '+' : '';
+    document.getElementById('stat-diff').textContent = `${diffSign}${diff.toFixed(1)}`;
+    document.getElementById('stat-diff').style.color = diff > 0 ? '#f59e0b' : diff < 0 ? '#38bdf8' : '#22c55e';
+
+    // Ideal note
+    const noteEl = document.getElementById('ideal-note');
+    if (Math.abs(diff) < 1) {
+      noteEl.innerHTML = `আপনার ওজন <strong>আদর্শের কাছাকাছি</strong>! আদর্শ ওজন ${idealRound} কেজি এবং আপনার ওজন ${weightKg.toFixed(1)} কেজি। দারুণ! ✅`;
+    } else if (diff > 0) {
+      noteEl.innerHTML = `আদর্শ ওজনে পৌঁছাতে আপনাকে প্রায় <strong>${diff.toFixed(1)} কেজি</strong> কমাতে হবে। আদর্শ ওজন: <strong>${idealRound} কেজি</strong>।`;
+    } else {
+      noteEl.innerHTML = `আদর্শ ওজনে পৌঁছাতে আপনাকে প্রায় <strong>${Math.abs(diff).toFixed(1)} কেজি</strong> বাড়াতে হবে। আদর্শ ওজন: <strong>${idealRound} কেজি</strong>।`;
+    }
+
+    // Tips
+    const tips = {
+      under: {
+        icon: '💙', head: 'ওজন বাড়ানোর পরামর্শ',
+        color: '#0c1f33', border: '#1e4060',
+        items: [
+          'প্রতিদিন ক্যালরি-ঘন খাবার খান — বাদাম, দুধ, ডিম, মাছ',
+          'তিন বেলার পাশাপাশি ২-৩টি স্বাস্থ্যকর স্ন্যাকস রাখুন',
+          'ওজন বাড়ানোর জন্য শক্তি প্রশিক্ষণ (Strength Training) করুন',
+          'পর্যাপ্ত ঘুম (৭-৮ ঘণ্টা) নিশ্চিত করুন',
+          'একজন পুষ্টিবিদের পরামর্শ নিন'
+        ]
+      },
+      normal: {
+        icon: '💚', head: 'স্বাস্থ্য ধরে রাখার পরামর্শ',
+        color: '#0a1f14', border: '#14532d',
+        items: [
+          'বর্তমান খাদ্যাভ্যাস বজায় রাখুন — আপনি সঠিক পথে আছেন!',
+          'সপ্তাহে কমপক্ষে ১৫০ মিনিট মাঝারি ব্যায়াম করুন',
+          'প্রচুর সবজি, ফল ও আঁশজাতীয় খাবার খান',
+          'প্রতিদিন ৮-১০ গ্লাস পানি পান করুন',
+          'নিয়মিত স্বাস্থ্য পরীক্ষা করান'
+        ]
+      },
+      over: {
+        icon: '🟡', head: 'ওজন নিয়ন্ত্রণের পরামর্শ',
+        color: '#1a1206', border: '#78350f',
+        items: [
+          'প্রতিদিনের খাবারে ক্যালরি সামান্য কমান (৩০০-৫০০ ক্যালরি)',
+          'ভাজাপোড়া, মিষ্টি ও প্রক্রিয়াজাত খাবার কমিয়ে আনুন',
+          'সপ্তাহে ৫ দিন কমপক্ষে ৩০ মিনিট হাঁটুন বা সাইকেল চালান',
+          'রাতের খাবার সন্ধ্যা ৭টার মধ্যে সেরে নিন',
+          'খাবার ধীরে ধীরে, ভালো করে চিবিয়ে খান'
+        ]
+      },
+      obese: {
+        icon: '❤️', head: 'স্বাস্থ্য উন্নয়নের পরামর্শ',
+        color: '#1a0808', border: '#7f1d1d',
+        items: [
+          'একজন ডাক্তার বা পুষ্টিবিদের সাথে পরিকল্পনা তৈরি করুন',
+          'চিনি, তেল ও পরিশোধিত কার্বোহাইড্রেট কঠোরভাবে কমান',
+          'হালকা ব্যায়াম দিয়ে শুরু করুন — প্রতিদিন ১৫ মিনিট হাঁটা',
+          'প্রতিদিন ৮ গ্লাস পানি পান করুন, কোমল পানীয় পরিহার করুন',
+          'রক্তচাপ, ডায়াবেটিস নিয়মিত পরীক্ষা করান'
+        ]
+      }
+    };
+
+    const t = tips[catKey];
+    const tipCard = document.getElementById('tip-card');
+    tipCard.style.background = t.color;
+    tipCard.style.borderColor = t.border;
+    document.getElementById('tip-head').innerHTML = `${t.icon} ${t.head}`;
+    document.getElementById('tip-head').style.color = color;
+    const ul = document.getElementById('tip-list');
+    ul.innerHTML = t.items.map(i => `<li>${i}</li>`).join('');
+
+    // Show results
+    const rs = document.getElementById('result-section');
+    rs.classList.add('show');
+    setTimeout(() => rs.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+  }
+
+  // Init display
+  updateHeight(170);
+  updateWeight(65);
+</script>
+</body>
+</html>
